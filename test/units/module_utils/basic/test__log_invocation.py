@@ -1,82 +1,71 @@
 # -*- coding: utf-8 -*-
 # (c) 2016, James Cammarata <jimi@sngx.net>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# (c) 2017, Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division)
-__metaclass__ = type
+from __future__ import annotations
 
-import sys
-import json
+import pytest
 
-from units.mock.procenv import swap_stdin_and_argv
+from ansible.module_utils import secrets
+from ansible.module_utils._internal import _logging
+from ansible.module_utils._internal._secrets import SecretMasker
 
-from ansible.compat.tests import unittest
-from ansible.compat.tests.mock import MagicMock
+ARGS = dict(foo=False, bar=[1, 2, 3], bam="bam", baz=u'baz')
+ARGUMENT_SPEC = dict(
+    foo=dict(default=True, type='bool'),
+    bar=dict(default=[], type='list'),
+    bam=dict(default="bam"),
+    baz=dict(default=u"baz"),
+    registered_secret=dict(default="My secret value"),
+    password=dict(default=True),
+    no_log=dict(default="you shouldn't see me", no_log=True),
+)
 
 
-class TestModuleUtilsBasic(unittest.TestCase):
-    @unittest.skipIf(sys.version_info[0] >= 3, "Python 3 is not supported on targets (yet)")
-    def test_module_utils_basic__log_invocation(self):
-        with swap_stdin_and_argv(stdin_data=json.dumps(
-            dict(
-                ANSIBLE_MODULE_ARGS=dict(
-                    foo=False, bar=[1,2,3], bam="bam", baz=u'baz'),
-                ))):
-            from ansible.module_utils import basic
+@pytest.mark.parametrize('am, stdin', [(ARGUMENT_SPEC, ARGS)], indirect=['am', 'stdin'])
+def test_module_utils_basic__log_invocation(am, mocker, monkeypatch):
 
-            # test basic log invocation
-            am = basic.AnsibleModule(
-                argument_spec=dict(
-                    foo = dict(default=True, type='bool'),
-                    bar = dict(default=[], type='list'),
-                    bam = dict(default="bam"),
-                    baz = dict(default=u"baz"),
-                    password = dict(default=True),
-                    no_log = dict(default="you shouldn't see me", no_log=True),
-                ),
-            )
+    temp_masker = SecretMasker()
+    temp_masker.register_secret_text("Invoked")
+    temp_masker.register_secret_text("My secret value")
 
-            am.log = MagicMock()
-            am._log_invocation()
+    logger_mock = mocker.MagicMock()
+    monkeypatch.setattr(_logging, 'log_to_system', logger_mock)
+    monkeypatch.setattr(secrets, '_secret_masker', temp_masker)
+    am._log_invocation()
 
-            # Message is generated from a dict so it will be in an unknown order.
-            # have to check this manually rather than with assert_called_with()
-            args = am.log.call_args[0]
-            self.assertEqual(len(args), 1)
-            message = args[0]
+    # Message is generated from a dict so it will be in an unknown order.
+    # have to check this manually rather than with assert_called_with()
+    args = logger_mock.call_args[0]
+    assert len(args) == 1
+    message = args[0]
 
-            self.assertEqual(len(message), len('Invoked with bam=bam bar=[1, 2, 3] foo=False baz=baz no_log=NOT_LOGGING_PARAMETER password=NOT_LOGGING_PASSWORD'))
-            self.assertTrue(message.startswith('Invoked with '))
-            self.assertIn(' bam=bam', message)
-            self.assertIn(' bar=[1, 2, 3]', message)
-            self.assertIn(' foo=False', message)
-            self.assertIn(' baz=baz', message)
-            self.assertIn(' no_log=NOT_LOGGING_PARAMETER', message)
-            self.assertIn(' password=NOT_LOGGING_PASSWORD', message)
+    assert len(message) == \
+        len('$REDACTED$ with bam=bam bar=[1, 2, 3] foo=False baz=baz no_log=$REDACTED$ password=$REDACTED$ registered_secret=$REDACTED$')
 
-            kwargs = am.log.call_args[1]
-            self.assertEqual(kwargs,
-                    dict(log_args={
-                        'foo': 'False',
-                        'bar': '[1, 2, 3]',
-                        'bam': 'bam',
-                        'baz': 'baz',
-                        'password': 'NOT_LOGGING_PASSWORD',
-                        'no_log': 'NOT_LOGGING_PARAMETER',
-                    })
-                )
+    assert message.startswith('$REDACTED$ with ')
+    assert ' bam=bam' in message
+    assert ' bar=[1, 2, 3]' in message
+    assert ' foo=False' in message
+    assert ' baz=baz' in message
+    assert ' no_log=$REDACTED$' in message
+    assert ' password=$REDACTED$' in message
+    assert ' registered_secret=$REDACTED$' in message
+
+    kwargs = logger_mock.call_args[1]
+    assert kwargs == \
+        dict(
+            module_name='ansible_unittest',
+            log_args={
+                'foo': 'False',
+                'bar': '[1, 2, 3]',
+                'bam': 'bam',
+                'baz': 'baz',
+                'registered_secret': '$REDACTED$',
+                'password': '$REDACTED$',
+                'no_log': "$REDACTED$",
+            },
+            syslog_facility='LOG_USER',
+            target_log_info=None,
+        )

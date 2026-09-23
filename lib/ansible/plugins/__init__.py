@@ -1,5 +1,6 @@
 # (c) 2012, Daniel Hokka Zakrisson <daniel@hozac.com>
 # (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com> and others
+# (c) 2017, Toshio Kuratomi <tkuratomi@ansible.com>
 #
 # This file is part of Ansible
 #
@@ -16,466 +17,183 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-import glob
-import imp
-import inspect
-import os
-import os.path
-import sys
-import warnings
-
-from collections import defaultdict
+import abc
+import functools
+import types
+import typing as t
 
 from ansible import constants as C
-from ansible.utils.unicode import to_unicode
+from ansible.errors import AnsibleError
+from ansible.utils.display import Display
+from ansible.utils import display as _display
 
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+from ansible.module_utils._internal import _plugin_info
+
+display = Display()
+
+if t.TYPE_CHECKING:
+    from . import loader as _t_loader
 
 # Global so that all instances of a PluginLoader will share the caches
-MODULE_CACHE = {}
-PATH_CACHE = {}
-PLUGIN_PATH_CACHE = {}
-
-def get_all_plugin_loaders():
-    return [(name, obj) for (name, obj) in inspect.getmembers(sys.modules[__name__]) if isinstance(obj, PluginLoader)]
-
-class PluginLoader:
-
-    '''
-    PluginLoader loads plugins from the configured plugin directories.
-
-    It searches for plugins by iterating through the combined list of
-    play basedirs, configured paths, and the python path.
-    The first match is used.
-    '''
-
-    def __init__(self, class_name, package, config, subdir, aliases={}, required_base_class=None):
-
-        self.class_name         = class_name
-        self.base_class         = required_base_class
-        self.package            = package
-        self.subdir             = subdir
-        self.aliases            = aliases
-
-        if config and not isinstance(config, list):
-            config = [config]
-        elif not config:
-            config = []
-
-        self.config = config
-
-        if not class_name in MODULE_CACHE:
-            MODULE_CACHE[class_name] = {}
-        if not class_name in PATH_CACHE:
-            PATH_CACHE[class_name] = None
-        if not class_name in PLUGIN_PATH_CACHE:
-            PLUGIN_PATH_CACHE[class_name] = defaultdict(dict)
-
-        self._module_cache      = MODULE_CACHE[class_name]
-        self._paths             = PATH_CACHE[class_name]
-        self._plugin_path_cache = PLUGIN_PATH_CACHE[class_name]
-
-        self._extra_dirs = []
-        self._searched_paths = set()
-
-    def __setstate__(self, data):
-        '''
-        Deserializer.
-        '''
-
-        class_name = data.get('class_name')
-        package    = data.get('package')
-        config     = data.get('config')
-        subdir     = data.get('subdir')
-        aliases    = data.get('aliases')
-        base_class = data.get('base_class')
-
-        PATH_CACHE[class_name] = data.get('PATH_CACHE')
-        PLUGIN_PATH_CACHE[class_name] = data.get('PLUGIN_PATH_CACHE')
-
-        self.__init__(class_name, package, config, subdir, aliases, base_class)
-        self._extra_dirs = data.get('_extra_dirs', [])
-        self._searched_paths = data.get('_searched_paths', set())
-
-    def __getstate__(self):
-        '''
-        Serializer.
-        '''
-
-        return dict(
-            class_name        = self.class_name,
-            base_class        = self.base_class,
-            package           = self.package,
-            config            = self.config,
-            subdir            = self.subdir,
-            aliases           = self.aliases,
-            _extra_dirs       = self._extra_dirs,
-            _searched_paths   = self._searched_paths,
-            PATH_CACHE        = PATH_CACHE[self.class_name],
-            PLUGIN_PATH_CACHE = PLUGIN_PATH_CACHE[self.class_name],
-        )
-
-    def print_paths(self):
-        ''' Returns a string suitable for printing of the search path '''
-
-        # Uses a list to get the order right
-        ret = []
-        for i in self._get_paths():
-            if i not in ret:
-                ret.append(i)
-        return os.pathsep.join(ret)
-
-    def _all_directories(self, dir):
-        results = []
-        results.append(dir)
-        for root, subdirs, files in os.walk(dir, followlinks=True):
-           if '__init__.py' in files:
-               for x in subdirs:
-                   results.append(os.path.join(root,x))
-        return results
-
-    def _get_package_paths(self):
-        ''' Gets the path of a Python package '''
-
-        if not self.package:
-            return []
-        if not hasattr(self, 'package_path'):
-            m = __import__(self.package)
-            parts = self.package.split('.')[1:]
-            for parent_mod in parts:
-                m = getattr(m, parent_mod)
-            self.package_path = os.path.dirname(m.__file__)
-        return self._all_directories(self.package_path)
-
-    def _get_paths(self):
-        ''' Return a list of paths to search for plugins in '''
-
-        if self._paths is not None:
-            return self._paths
-
-        ret = self._extra_dirs[:]
-
-        # look in any configured plugin paths, allow one level deep for subcategories
-        if self.config is not None:
-            for path in self.config:
-                path = os.path.realpath(os.path.expanduser(path))
-                contents = glob.glob("%s/*" % path) + glob.glob("%s/*/*" % path)
-                for c in contents:
-                    if os.path.isdir(c) and c not in ret:
-                        ret.append(c)
-                if path not in ret:
-                    ret.append(path)
-
-        # look for any plugins installed in the package subtree
-        ret.extend(self._get_package_paths())
-
-        # HACK: because powershell modules are in the same directory
-        # hierarchy as other modules we have to process them last.  This is
-        # because powershell only works on windows but the other modules work
-        # anywhere (possibly including windows if the correct language
-        # interpreter is installed).  the non-powershell modules can have any
-        # file extension and thus powershell modules are picked up in that.
-        # The non-hack way to fix this is to have powershell modules be
-        # a different PluginLoader/ModuleLoader.  But that requires changing
-        # other things too (known thing to change would be PATHS_CACHE,
-        # PLUGIN_PATHS_CACHE, and MODULE_CACHE.  Since those three dicts key
-        # on the class_name and neither regular modules nor powershell modules
-        # would have class_names, they would not work as written.
-        reordered_paths = []
-        win_dirs = []
-        for path in ret:
-            if path.endswith('windows'):
-                win_dirs.append(path)
-            else:
-                reordered_paths.append(path)
-        reordered_paths.extend(win_dirs)
-
-        # cache and return the result
-        self._paths = reordered_paths
-        return reordered_paths
+MODULE_CACHE = {}  # type: dict[str, dict[str, types.ModuleType]]
+PATH_CACHE = {}  # type: dict[str, list[_t_loader.PluginPathContext] | None]
+PLUGIN_PATH_CACHE = {}  # type: dict[str, dict[str, dict[str, _t_loader.PluginPathContext]]]
 
 
-    def add_directory(self, directory, with_subdir=False):
-        ''' Adds an additional directory to the search path '''
+def get_plugin_class(obj):
+    if isinstance(obj, str):
+        return obj.lower().replace('module', '')
+    else:
+        return obj.__class__.__name__.lower().replace('module', '')
 
-        directory = os.path.realpath(directory)
 
-        if directory is not None:
-            if with_subdir:
-                directory = os.path.join(directory, self.subdir)
-            if directory not in self._extra_dirs:
-                # append the directory and invalidate the path cache
-                self._extra_dirs.append(directory)
-                self._paths = None
+class _ConfigurablePlugin(t.Protocol):
+    """Protocol to provide type-safe access to config for plugin-related mixins."""
 
-    def find_plugin(self, name, mod_type=''):
-        ''' Find a plugin named name '''
+    def get_option(self, option: str, hostvars: dict[str, object] | None = None) -> t.Any: ...
 
-        if mod_type:
-            suffix = mod_type
-        elif self.class_name:
-            # Ansible plugins that run in the controller process (most plugins)
-            suffix = '.py'
-        else:
-            # Only Ansible Modules.  Ansible modules can be any executable so
-            # they can have any suffix
-            suffix = ''
 
-        # The particular cache to look for modules within.  This matches the
-        # requested mod_type
-        pull_cache = self._plugin_path_cache[suffix]
-        try:
-            return pull_cache[name]
-        except KeyError:
-            # Cache miss.  Now let's find the plugin
-            pass
+class _AnsiblePluginInfoMixin(_plugin_info.HasPluginInfo):
+    """Mixin to provide type annotations and default values for existing PluginLoader-set load-time attrs."""
+    _original_path: str | None = None
+    _load_name: str | None = None
+    _redirected_names: list[str] | None = None
+    ansible_aliases: list[str] | None = None
+    ansible_name: str | None = None
 
-        # TODO: Instead of using the self._paths cache (PATH_CACHE) and
-        #       self._searched_paths we could use an iterator.  Before enabling that
-        #       we need to make sure we don't want to add additional directories
-        #       (add_directory()) once we start using the iterator.  Currently, it
-        #       looks like _get_paths() never forces a cache refresh so if we expect
-        #       additional directories to be added later, it is buggy.
-        for path in (p for p in self._get_paths() if p not in self._searched_paths and os.path.isdir(p)):
+    @property
+    def plugin_type(self) -> str:
+        return self.__class__.__name__.lower().replace('module', '')
+
+
+class AnsiblePlugin(_AnsiblePluginInfoMixin, _ConfigurablePlugin, metaclass=abc.ABCMeta):
+
+    # Set by plugin loader
+    _load_name: str
+
+    # allow extra passthrough parameters
+    allow_extras: bool = False
+    _extras_prefix: str | None = None
+
+    def __init__(self):
+        self._options = {}
+        self._origins = {}
+        self._defs = None
+
+    @property
+    def extras_prefix(self):
+        if not self._extras_prefix:
+            self._extras_prefix = self._load_name.split('.')[-1]
+        return self._extras_prefix
+
+    def matches_name(self, possible_names):
+        possible_fqcns = set()
+        for name in possible_names:
+            if '.' not in name:
+                possible_fqcns.add(f"ansible.builtin.{name}")
+            elif name.startswith("ansible.legacy."):
+                possible_fqcns.add(name.removeprefix("ansible.legacy."))
+            possible_fqcns.add(name)
+        return bool(possible_fqcns.intersection(set(self.ansible_aliases)))
+
+    def get_option_and_origin(self, option, hostvars=None):
+        if option not in self._options:
             try:
-                full_paths = (os.path.join(path, f) for f in os.listdir(path))
-            except OSError as e:
-                display.warning("Error accessing plugin paths: %s" % to_unicode(e))
+                # some plugins don't use set_option(s) and cannot use direct settings, so this populates the local copy for them
+                self._options[option], self._origins[option] = C.config.get_config_value_and_origin(option, plugin_type=self.plugin_type,
+                                                                                                    plugin_name=self._load_name, variables=hostvars)
+            except AnsibleError as e:
+                # callers expect key error on missing
+                raise KeyError() from e
 
-            for full_path in (f for f in full_paths if os.path.isfile(f) and not f.endswith('__init__.py')):
-                full_name = os.path.basename(full_path)
+        return self._options[option], self._origins[option]
 
-                # HACK: We have no way of executing python byte
-                # compiled files as ansible modules so specifically exclude them
-                if full_path.endswith(('.pyc', '.pyo')):
-                    continue
+    @functools.cached_property
+    def __plugin_info(self):
+        """
+        Internal cached property to retrieve `PluginInfo` for this plugin instance.
+        Only for use by the `AnsiblePlugin` base class.
+        """
+        return _plugin_info.get_plugin_info(self)
 
-                splitname = os.path.splitext(full_name)
-                base_name = splitname[0]
-                try:
-                    extension = splitname[1]
-                except IndexError:
-                    extension = ''
+    def get_option(self, option, hostvars=None):
+        if option not in self._options:
+            # let it populate _options
+            self.get_option_and_origin(option, hostvars=hostvars)
+        return self._options[option]
 
-                # Module found, now enter it into the caches that match
-                # this file
-                if base_name not in self._plugin_path_cache['']:
-                    self._plugin_path_cache[''][base_name] = full_path
+    def get_options(self, hostvars=None):
+        options = {}
+        for option in self.option_definitions.keys():
+            options[option] = self.get_option(option, hostvars=hostvars)
+        return options
 
-                if full_name not in self._plugin_path_cache['']:
-                    self._plugin_path_cache[''][full_name] = full_path
+    def set_option(self, option, value):
+        self._options[option] = C.config.get_config_value(option, plugin_type=self.plugin_type, plugin_name=self._load_name, direct={option: value})
+        self._origins[option] = 'Direct'
+        _display._report_config_warnings(self.__plugin_info)
 
-                if base_name not in self._plugin_path_cache[extension]:
-                    self._plugin_path_cache[extension][base_name] = full_path
+    def set_options(self, task_keys=None, var_options=None, direct=None):
+        """
+        Sets the _options attribute with the configuration/keyword information for this plugin
 
-                if full_name not in self._plugin_path_cache[extension]:
-                    self._plugin_path_cache[extension][full_name] = full_path
+        :arg task_keys: Dict with playbook keywords that affect this option
+        :arg var_options: Dict with either 'connection variables'
+        :arg direct: Dict with 'direct assignment'
+        """
+        self._options, self._origins = C.config.get_plugin_options_and_origins(self.plugin_type, self._load_name, keys=task_keys,
+                                                                               variables=var_options, direct=direct)
 
-            self._searched_paths.add(path)
-            try:
-                return pull_cache[name]
-            except KeyError:
-                # Didn't find the plugin in this directory.  Load modules from
-                # the next one
-                pass
+        # allow extras/wildcards from vars that are not directly consumed in configuration
+        # this is needed to support things like winrm that can have extended protocol options we don't directly handle
+        if self.allow_extras and var_options and '_extras' in var_options:
+            # these are largely unvalidated passthroughs, either plugin or underlying API will validate
+            # TODO: deprecate and remove, most plugins that needed this don't use this facility anymore
+            self._options['_extras'] = var_options['_extras']
+        _display._report_config_warnings(self.__plugin_info)
 
-        # if nothing is found, try finding alias/deprecated
-        if not name.startswith('_'):
-            alias_name = '_' + name
-            # We've already cached all the paths at this point
-            if alias_name in pull_cache:
-                if not os.path.islink(pull_cache[alias_name]):
-                    display.deprecated('%s is kept for backwards compatibility '
-                              'but usage is discouraged. The module '
-                              'documentation details page may explain '
-                              'more about this rationale.' %
-                              name.lstrip('_'))
-                return pull_cache[alias_name]
+    def has_option(self, option):
+        if not self._options:
+            self.set_options()
+        return option in self._options
 
-        return None
+    @property
+    def option_definitions(self):
+        if (not hasattr(self, "_defs")) or self._defs is None:
+            self._defs = C.config.get_configuration_definitions(plugin_type=self.plugin_type, name=self._load_name)
+        return self._defs
 
-    def has_plugin(self, name):
-        ''' Checks if a plugin named name exists '''
+    def _check_required(self):
+        # FIXME: standardize required check based on config
+        pass
 
-        return self.find_plugin(name) is not None
+    def __repr__(self):
+        ansible_name = getattr(self, 'ansible_name', '(unknown)')
+        load_name = getattr(self, '_load_name', '(unknown)')
+        return f'{type(self).__name__}(plugin_type={self.plugin_type!r}, {ansible_name=!r}, {load_name=!r})'
 
-    __contains__ = has_plugin
 
-    def _load_module_source(self, name, path):
-        if name in sys.modules:
-            # See https://github.com/ansible/ansible/issues/13110
-            return sys.modules[name]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            with open(path, 'r') as module_file:
-                module = imp.load_source(name, path, module_file)
-        return module
+class AnsibleJinja2Plugin(AnsiblePlugin, metaclass=abc.ABCMeta):
+    def __init__(self, function: t.Callable) -> None:
+        super(AnsibleJinja2Plugin, self).__init__()
+        self._function = function
 
-    def get(self, name, *args, **kwargs):
-        ''' instantiates a plugin of the given name using arguments '''
+        # Declare support for markers. Plugins with `False` here will never be invoked with markers for top-level arguments.
+        self.accept_args_markers = getattr(self._function, 'accept_args_markers', False)
+        self.accept_lazy_markers = getattr(self._function, 'accept_lazy_markers', False)
 
-        class_only = kwargs.pop('class_only', False)
-        if name in self.aliases:
-            name = self.aliases[name]
-        path = self.find_plugin(name)
-        if path is None:
-            return None
+    @property
+    @abc.abstractmethod
+    def plugin_type(self) -> str:
+        ...
 
-        if path not in self._module_cache:
-            self._module_cache[path] = self._load_module_source('.'.join([self.package, name]), path)
+    def _no_options(self, *args, **kwargs) -> t.NoReturn:
+        raise NotImplementedError()
 
-        obj = getattr(self._module_cache[path], self.class_name)
-        if self.base_class:
-            # The import path is hardcoded and should be the right place,
-            # so we are not expecting an ImportError.
-            module = __import__(self.package, fromlist=[self.base_class])
-            # Check whether this obj has the required base class.
-            try:
-                plugin_class = getattr(module, self.base_class)
-            except AttributeError:
-                return None
-            if not issubclass(obj, plugin_class):
-                return None
+    has_option = get_option = get_options = option_definitions = set_option = set_options = _no_options
 
-        if not class_only:
-            obj = obj(*args, **kwargs)
-
-        return obj
-
-    def all(self, *args, **kwargs):
-        ''' instantiates all plugins with the same arguments '''
-
-        class_only = kwargs.pop('class_only', False)
-        all_matches = []
-
-        for i in self._get_paths():
-            all_matches.extend(glob.glob(os.path.join(i, "*.py")))
-
-        for path in sorted(all_matches, key=lambda match: os.path.basename(match)):
-            name, _ = os.path.splitext(path)
-            if '__init__' in name:
-                continue
-
-            if path not in self._module_cache:
-                self._module_cache[path] = self._load_module_source(name, path)
-
-            try:
-                obj = getattr(self._module_cache[path], self.class_name)
-            except AttributeError as e:
-                display.warning("Skipping plugin (%s) as it seems to be invalid: %s" % (path, to_unicode(e)))
-
-            if self.base_class:
-                # The import path is hardcoded and should be the right place,
-                # so we are not expecting an ImportError.
-                module = __import__(self.package, fromlist=[self.base_class])
-                # Check whether this obj has the required base class.
-                try:
-                   plugin_class = getattr(module, self.base_class)
-                except AttributeError:
-                   continue
-                if not issubclass(obj, plugin_class):
-                   continue
-
-            if not class_only:
-                obj = obj(*args, **kwargs)
-
-            # set extra info on the module, in case we want it later
-            setattr(obj, '_original_path', path)
-            yield obj
-
-action_loader = PluginLoader(
-    'ActionModule',
-    'ansible.plugins.action',
-    C.DEFAULT_ACTION_PLUGIN_PATH,
-    'action_plugins',
-    required_base_class='ActionBase',
-)
-
-cache_loader = PluginLoader(
-    'CacheModule',
-    'ansible.plugins.cache',
-    C.DEFAULT_CACHE_PLUGIN_PATH,
-    'cache_plugins',
-)
-
-callback_loader = PluginLoader(
-    'CallbackModule',
-    'ansible.plugins.callback',
-    C.DEFAULT_CALLBACK_PLUGIN_PATH,
-    'callback_plugins',
-)
-
-connection_loader = PluginLoader(
-    'Connection',
-    'ansible.plugins.connection',
-    C.DEFAULT_CONNECTION_PLUGIN_PATH,
-    'connection_plugins',
-    aliases={'paramiko': 'paramiko_ssh'},
-    required_base_class='ConnectionBase',
-)
-
-shell_loader = PluginLoader(
-    'ShellModule',
-    'ansible.plugins.shell',
-    'shell_plugins',
-    'shell_plugins',
-)
-
-module_loader = PluginLoader(
-    '',
-    'ansible.modules',
-    C.DEFAULT_MODULE_PATH,
-    'library',
-)
-
-lookup_loader = PluginLoader(
-    'LookupModule',
-    'ansible.plugins.lookup',
-    C.DEFAULT_LOOKUP_PLUGIN_PATH,
-    'lookup_plugins',
-    required_base_class='LookupBase',
-)
-
-vars_loader = PluginLoader(
-    'VarsModule',
-    'ansible.plugins.vars',
-    C.DEFAULT_VARS_PLUGIN_PATH,
-    'vars_plugins',
-)
-
-filter_loader = PluginLoader(
-    'FilterModule',
-    'ansible.plugins.filter',
-    C.DEFAULT_FILTER_PLUGIN_PATH,
-    'filter_plugins',
-)
-
-test_loader = PluginLoader(
-    'TestModule',
-    'ansible.plugins.test',
-    C.DEFAULT_TEST_PLUGIN_PATH,
-    'test_plugins'
-)
-
-fragment_loader = PluginLoader(
-    'ModuleDocFragment',
-    'ansible.utils.module_docs_fragments',
-    os.path.join(os.path.dirname(__file__), 'module_docs_fragments'),
-    '',
-)
-
-strategy_loader = PluginLoader(
-    'StrategyModule',
-    'ansible.plugins.strategy',
-    C.DEFAULT_STRATEGY_PLUGIN_PATH,
-    'strategy_plugins',
-    required_base_class='StrategyBase',
-)
+    @property
+    def j2_function(self) -> t.Callable:
+        return self._function

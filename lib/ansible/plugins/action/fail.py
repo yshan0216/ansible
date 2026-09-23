@@ -15,22 +15,24 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 from ansible.plugins.action import ActionBase
 
 
 class ActionModule(ActionBase):
-    ''' Fail with custom message '''
+    """ Fail with custom message """
 
     TRANSFERS_FILES = False
+    _VALID_ARGS = frozenset(('msg',))
+    _requires_connection = False
 
     def run(self, tmp=None, task_vars=None):
         if task_vars is None:
             task_vars = dict()
 
         result = super(ActionModule, self).run(tmp, task_vars)
+        del tmp  # tmp no longer has any effect
 
         msg = 'Failed as requested from task'
         if self._task.args and 'msg' in self._task.args:

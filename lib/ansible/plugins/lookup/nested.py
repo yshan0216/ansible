@@ -1,56 +1,69 @@
 # (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+# (c) 2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+from __future__ import annotations
 
-from jinja2.exceptions import UndefinedError
+DOCUMENTATION = """
+    name: nested
+    version_added: "1.1"
+    short_description: composes a list with nested elements of other lists
+    description:
+        - Takes the input lists and returns a list with elements that are lists composed of the elements of the input lists
+    positional: _raw
+    options:
+      _raw:
+         description:
+           - a set of lists
+         required: True
+"""
 
-from ansible.errors import AnsibleError, AnsibleUndefinedVariable
+EXAMPLES = """
+- name: give users access to multiple databases
+  community.mysql.mysql_user:
+    name: "{{ item[0] }}"
+    priv: "{{ item[1] }}.*:ALL"
+    append_privs: yes
+    password: "foo"
+  with_nested:
+    - [ 'alice', 'bob' ]
+    - [ 'clientdb', 'employeedb', 'providerdb' ]
+# As with the case of 'with_items' above, you can use previously defined variables.:
+
+- name: here, 'users' contains the above list of employees
+  community.mysql.mysql_user:
+    name: "{{ item[0] }}"
+    priv: "{{ item[1] }}.*:ALL"
+    append_privs: yes
+    password: "foo"
+  with_nested:
+    - "{{ users }}"
+    - [ 'clientdb', 'employeedb', 'providerdb' ]
+"""
+
+RETURN = """
+  _list:
+    description:
+      - A list composed of lists paring the elements of the input lists
+    type: list
+"""
+
+
+from ansible.errors import AnsibleError
 from ansible.plugins.lookup import LookupBase
-from ansible.utils.listify import listify_lookup_plugin_terms
+
 
 class LookupModule(LookupBase):
-
-    def _lookup_variables(self, terms, variables):
-        results = []
-        for x in terms:
-            try:
-                intermediate = listify_lookup_plugin_terms(x, templar=self._templar, loader=self._loader, fail_on_undefined=True)
-            except UndefinedError as e:
-                raise AnsibleUndefinedVariable("One of the nested variables was undefined. The error was: %s" % e)
-            results.append(intermediate)
-        return results
-
     def run(self, terms, variables=None, **kwargs):
-
-        terms = self._lookup_variables(terms, variables)
-
         my_list = terms[:]
         my_list.reverse()
-        result = []
+
         if len(my_list) == 0:
             raise AnsibleError("with_nested requires at least one element in the nested list")
         result = my_list.pop()
         while len(my_list) > 0:
             result2 = self._combine(result, my_list.pop())
-            result  = result2
+            result = result2
         new_result = []
         for x in result:
             new_result.append(self._flatten(x))
         return new_result
-
-

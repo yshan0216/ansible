@@ -14,59 +14,93 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
+from ansible.errors import AnsibleActionFail
+from ansible.executor.module_common import _apply_action_arg_defaults
+from ansible.module_utils.facts.system.pkg_mgr import PKG_MGRS
 from ansible.plugins.action import ActionBase
+from ansible.utils.display import Display
+from ansible.utils.vars import combine_vars
 
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+display = Display()
 
 
 class ActionModule(ActionBase):
 
     TRANSFERS_FILES = False
 
-    def run(self, tmp=None, task_vars=None):
-        ''' handler for package operations '''
-        if task_vars is None:
-            task_vars = dict()
+    BUILTIN_PKG_MGR_MODULES = {manager['name'] for manager in PKG_MGRS}
 
-        result = super(ActionModule, self).run(tmp, task_vars)
+    def run(self, tmp=None, task_vars=None):
+        """ handler for package operations """
+
+        self._supports_check_mode = True
+        self._supports_async = True
+
+        super(ActionModule, self).run(tmp, task_vars)
 
         module = self._task.args.get('use', 'auto')
 
-        if module == 'auto':
-            try:
-                module = self._templar.template('{{ansible_pkg_mgr}}')
-            except:
-                pass # could not get it from template!
+        try:
+            if module == 'auto':
 
-        if module == 'auto':
-            facts = self._execute_module(module_name='setup', module_args=dict(filter='ansible_pkg_mgr', gather_subset='!all'), task_vars=task_vars)
-            display.debug("Facts %s" % facts)
-            if 'ansible_facts' in facts and  'ansible_pkg_mgr' in facts['ansible_facts']:
-                module = getattr(facts['ansible_facts'], 'ansible_pkg_mgr', 'auto')
+                if self._task.delegate_to:
+                    hosts_vars = task_vars['hostvars'][self._task.delegate_to]
+                    tvars = combine_vars(self._task.vars, task_vars.get('delegated_vars', {}))
+                else:
+                    hosts_vars = task_vars
+                    tvars = task_vars
 
-        if module != 'auto':
+                # use config
+                module = tvars.get('ansible_package_use', None)
 
-            if module not in self._shared_loader_obj.module_loader:
-                result['failed'] = True
-                result['msg'] = 'Could not find a module for %s.' % module
-                return result
+                if not module:
+                    # no use, no config, get from facts
+                    if hosts_vars.get('ansible_facts', {}).get('pkg_mgr', False):
+                        facts = hosts_vars
+                        pmgr = 'pkg_mgr'
+                    else:
+                        # we had no facts, so generate them
+                        # very expensive step, we actually run fact gathering because we don't have facts for this host.
+                        facts = self._execute_module(
+                            module_name='ansible.legacy.setup',
+                            module_args=dict(filter='ansible_pkg_mgr', gather_subset='!all'),
+                            task_vars=task_vars,
+                        )
+                        if facts.get("failed", False):
+                            raise AnsibleActionFail(
+                                f"Failed to fetch ansible_pkg_mgr to determine the package action backend: {facts.get('msg')}",
+                                result=facts,
+                            )
+                        pmgr = 'ansible_pkg_mgr'
 
-            # run the 'package' module
-            new_module_args = self._task.args.copy()
-            if 'use' in new_module_args:
-                del new_module_args['use']
+                    try:
+                        # actually get from facts
+                        module = facts['ansible_facts'][pmgr]
+                    except KeyError:
+                        raise AnsibleActionFail('Could not detect a package manager. Try using the "use" option.')
 
-            display.vvvv("Running %s" % module)
-            result.update(self._execute_module(module_name=module, module_args=new_module_args, task_vars=task_vars))
-            return result
-        else:
-            result['failed'] = True
-            result['msg'] = 'Could not detect which package manager to use. Try gathering facts or setting the "use" option.'
-            return result
+            if module and module != 'auto':
+                if not self._shared_loader_obj.module_loader.has_plugin(module):
+                    raise AnsibleActionFail('Could not find a matching action for the "%s" package manager.' % module)
+                else:
+                    # run the 'package' module
+                    new_module_args = self._task.args.copy()
+                    if 'use' in new_module_args:
+                        del new_module_args['use']
+
+                    # get defaults for specific module
+                    context = self._shared_loader_obj.module_loader.find_plugin_with_context(module, collection_list=self._task.collections)
+                    new_module_args = _apply_action_arg_defaults(context.resolved_fqcn, self._task, new_module_args, self._templar)
+
+                    if module in self.BUILTIN_PKG_MGR_MODULES:
+                        # prefix with ansible.legacy to eliminate external collisions while still allowing library/ override
+                        module = 'ansible.legacy.' + module
+
+                    display.vvvv("Running %s" % module)
+                    return self._execute_module(module_name=module, module_args=new_module_args, task_vars=task_vars, wrap_async=self._task.async_val)
+            else:
+                raise AnsibleActionFail('Could not detect which package manager to use. Try gathering facts or setting the "use" option.')
+        finally:
+            pass  # avoid de-dent all on refactor

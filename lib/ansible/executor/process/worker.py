@@ -15,134 +15,256 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-from ansible.compat.six.moves import queue
-
-import json
-import multiprocessing
+import errno
+import io
 import os
 import signal
 import sys
-import time
+import textwrap
 import traceback
-import zlib
+import types
+import typing as t
 
-from jinja2.exceptions import TemplateNotFound
+from multiprocessing.queues import Queue
 
-# TODO: not needed if we use the cryptography library with its default RNG
-# engine
-HAS_ATFORK=True
-try:
-    from Crypto.Random import atfork
-except ImportError:
-    HAS_ATFORK=False
-
-from ansible.errors import AnsibleError, AnsibleConnectionFailure
+from ansible._internal import _task
+from ansible import constants as C
+from ansible.errors import AnsibleError
 from ansible.executor.task_executor import TaskExecutor
-from ansible.executor.task_result import TaskResult
-from ansible.playbook.handler import Handler
+from ansible.executor.task_queue_manager import FinalQueue, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO
+from ansible.inventory.host import Host
+from ansible.module_utils._internal import _debug
+from ansible.parsing.dataloader import DataLoader
 from ansible.playbook.task import Task
-from ansible.vars.unsafe_proxy import AnsibleJSONUnsafeDecoder
-from ansible.utils.unicode import to_unicode
-
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+from ansible.playbook.play_context import PlayContext
+from ansible.utils.context_objects import CLIArgs
+from ansible.utils.display import Display
+from ansible.utils.multiprocessing import context as multiprocessing_context
+from ansible.vars.manager import VariableManager
 
 __all__ = ['WorkerProcess']
 
+display = Display()
 
-class WorkerProcess(multiprocessing.Process):
-    '''
+current_worker = None
+
+
+class WorkerQueue(Queue):
+    """Queue that raises AnsibleError items on get()."""
+    def get(self, *args, **kwargs):
+        result = super(WorkerQueue, self).get(*args, **kwargs)
+        if isinstance(result, AnsibleError):
+            raise result
+        return result
+
+
+class WorkerProcess(multiprocessing_context.Process):  # type: ignore[name-defined]
+    """
     The worker thread class, which uses TaskExecutor to run tasks
     read from a job queue and pushes results into a results queue
     for reading later.
-    '''
+    """
 
-    def __init__(self, rslt_q, task_vars, host, task, play_context, loader, variable_manager, shared_loader_obj):
+    def __init__(
+            self,
+            *,
+            final_q: FinalQueue,
+            task_vars: dict,
+            host: Host,
+            task: Task,
+            play_context: PlayContext,
+            loader: DataLoader,
+            variable_manager: VariableManager,
+            shared_loader_obj: types.SimpleNamespace,
+            worker_id: int,
+            cliargs: CLIArgs,
+            stacktrace_dir: str | None = None,
+    ) -> None:
 
         super(WorkerProcess, self).__init__()
         # takes a task queue manager as the sole param:
-        self._rslt_q            = rslt_q
-        self._task_vars         = task_vars
-        self._host              = host
-        self._task              = task
-        self._play_context      = play_context
-        self._loader            = loader
-        self._variable_manager  = variable_manager
+        self._final_q = final_q
+        self._task_vars = task_vars
+        self._host = host
+        self._task = task
+        self._play_context = play_context
+        self._loader = loader
+        self._variable_manager = variable_manager
         self._shared_loader_obj = shared_loader_obj
 
-        # dupe stdin, if we have one
-        self._new_stdin = sys.stdin
+        # NOTE: this works due to fork, if switching to threads this should change to per thread storage of temp files
+        # clear var to ensure we only delete files for this child
+        self._loader._tempfiles = set()
+
+        self.worker_queue = WorkerQueue(ctx=multiprocessing_context)
+        self.worker_id = worker_id
+
+        self._cliargs = cliargs
+        self._stacktrace_dir = stacktrace_dir
+
+    def _term(self, signum, frame) -> None:
+        """In child termination when notified by the parent"""
+        signal.signal(signum, signal.SIG_DFL)
+
         try:
-            fileno = sys.stdin.fileno()
-            if fileno is not None:
-                try:
-                    self._new_stdin = os.fdopen(os.dup(fileno))
-                except OSError:
-                    # couldn't dupe stdin, most likely because it's
-                    # not a valid file descriptor, so we just rely on
-                    # using the one that was passed in
-                    pass
-        except ValueError:
-            # couldn't get stdin's fileno, so we just carry on
+            os.killpg(self.pid, signum)
+            os.kill(self.pid, signum)
+        except OSError as e:
+            if e.errno != errno.ESRCH:
+                signame = signal.strsignal(signum)
+                display.error(f'Unable to send {signame} to child[{self.pid}]: {e}')
+
+        # fallthrough, if we are still here, just die
+        os._exit(1)
+
+    def start(self) -> None:
+        """
+        multiprocessing.Process replaces the worker's stdin with a new file
+        but we wish to preserve it if it is connected to a terminal.
+        Therefore dup a copy prior to calling the real start(),
+        ensuring the descriptor is preserved somewhere in the new child, and
+        make sure it is closed in the parent when start() completes.
+        """
+
+        # FUTURE: this lock can be removed once a more generalized pre-fork thread pause is in place
+        with display._lock:
+            super(WorkerProcess, self).start()
+
+    def _hard_exit(self, e: str) -> t.NoReturn:
+        """
+        There is no safe exception to return to higher level code that does not
+        risk an innocent try/except finding itself executing in the wrong
+        process. All code executing above WorkerProcess.run() on the stack
+        conceptually belongs to another program.
+        """
+
+        try:
+            display.error(e)
+        except BaseException:
+            # If the cause of the fault is OSError being generated by stdio,
+            # attempting to log a debug message may trigger another OSError.
+            # Try printing once then give up.
             pass
 
-    def run(self):
-        '''
+        os._exit(1)
+
+    def _detach(self) -> None:
+        """
+        The intent here is to detach the child process from the inherited stdio fds,
+        including /dev/tty. Children should use Display instead of direct interactions
+        with stdio fds.
+        """
+        try:
+            if C.config.get_config_value('WORKER_SESSION_ISOLATION', variables=self._task_vars):
+                os.setsid()  # create a new session and process group for this worker (fully isolated from parent session resources, e.g., inherited TTY)
+            else:
+                os.setpgid(0, 0)  # isolation disabled, just make this worker a new process group leader for granular child process tracking
+
+            # Create new fds for stdin/stdout/stderr, but also capture python uses of sys.stdout/stderr
+            for fds, mode in (
+                    ((STDIN_FILENO,), os.O_RDWR | os.O_NONBLOCK),
+                    ((STDOUT_FILENO, STDERR_FILENO), os.O_WRONLY),
+            ):
+                stdio = os.open(os.devnull, mode)
+                for fd in fds:
+                    os.dup2(stdio, fd)
+                os.close(stdio)
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            sys.stdin = os.fdopen(STDIN_FILENO, 'r', closefd=False)
+            # Close stdin so we don't get hanging workers
+            # We use sys.stdin.close() for places where sys.stdin is used,
+            # to give better errors, and to prevent fd 0 reuse
+            sys.stdin.close()
+        except Exception as e:
+            display.error(f'Could not detach from stdio: {e}')
+            os._exit(1)
+
+    def run(self) -> None:
+        """
+        Wrap _run() to ensure no possibility an errant exception can cause
+        control to return to the StrategyBase task loop, or any other code
+        higher in the stack.
+
+        As multiprocessing in Python 2.x provides no protection, it is possible
+        a try/except added in far-away code can cause a crashed child process
+        to suddenly assume the role and prior state of its parent.
+        """
+        # Set the queue on Display so calls to Display.display are proxied over the queue
+        display.set_queue(self._final_q)
+        self._detach()
+
+        # No need to create the stacktrace directory since TQM does that for us.
+        _debug.register_for_stacktrace(self._stacktrace_dir)
+
+        # propagate signals
+        signal.signal(signal.SIGINT, self._term)
+        signal.signal(signal.SIGTERM, self._term)
+
+        try:
+            with _task.TaskContext.create(task=self._task, task_vars=self._task_vars, host_name=self._host.name):
+                return self._run()
+        except BaseException:
+            self._hard_exit(traceback.format_exc())
+
+    def _run(self) -> None:
+        """
         Called when the process is started.  Pushes the result onto the
         results queue. We also remove the host from the blocked hosts list, to
         signify that they are ready for their next task.
-        '''
+        """
 
-        if HAS_ATFORK:
-            atfork()
+        global current_worker
+
+        current_worker = self
+
+        self._task.squash()
+
+        te = TaskExecutor(
+            self._host,
+            self._play_context,
+            self._loader,
+            self._shared_loader_obj,
+            self._final_q,
+            self._variable_manager,
+        )
+
+        utr = te.run()
+        utr.finalize_registered_values()
+
+        self._host.vars = dict()
+        self._host.groups = []
+
+        for name, stdio in (('stdout', sys.stdout), ('stderr', sys.stderr)):
+            if data := stdio.getvalue():  # type: ignore[union-attr]
+                display.warning(
+                    (
+                        f'WorkerProcess for [{self._host}/{self._task}] errantly sent data directly to {name} instead of using Display:\n'
+                        f'{textwrap.indent(data[:256], "    ")}\n'
+                    ),
+                    formatted=True
+                )
+
+        # manually update the original task object's values with final post-loop-resolved values since callbacks consult them
+        self._task.ignore_errors = utr.ignore_errors
+        self._task.ignore_unreachable = utr.ignore_unreachable
 
         try:
-            # execute the task and build a TaskResult from the result
-            display.debug("running TaskExecutor() for %s/%s" % (self._host, self._task))
-            executor_result = TaskExecutor(
-                self._host,
-                self._task,
-                self._task_vars,
-                self._play_context,
-                self._new_stdin,
-                self._loader,
-                self._shared_loader_obj,
-                self._rslt_q
-            ).run()
+            self._final_q.send_task_result(self._host, self._task, utr)
+        except Exception as ex:
+            try:
+                raise AnsibleError("Task result omitted due to queue send failure.") from ex
+            except Exception as ex_wrapper:
+                host = Host(name=self._host.name)
 
-            display.debug("done running TaskExecutor() for %s/%s" % (self._host, self._task))
-            self._host.vars = dict()
-            self._host.groups = []
-            task_result = TaskResult(self._host, self._task, executor_result)
+                task = Task()
+                task._uuid = self._task._uuid
 
-            # put the result on the result queue
-            display.debug("sending task result")
-            self._rslt_q.put(task_result)
-            display.debug("done sending task result")
+                utr = _task.UnifiedTaskResult.create_from_action_exception(ex_wrapper)
+                utr.finalize_registered_values()
 
-        except AnsibleConnectionFailure:
-            self._host.vars = dict()
-            self._host.groups = []
-            task_result = TaskResult(self._host, self._task, dict(unreachable=True))
-            self._rslt_q.put(task_result, block=False)
-
-        except Exception as e:
-            if not isinstance(e, (IOError, EOFError, KeyboardInterrupt, SystemExit)) or isinstance(e, TemplateNotFound):
-                try:
-                    self._host.vars = dict()
-                    self._host.groups = []
-                    task_result = TaskResult(self._host, self._task, dict(failed=True, exception=to_unicode(traceback.format_exc()), stdout=''))
-                    self._rslt_q.put(task_result, block=False)
-                except:
-                    display.debug(u"WORKER EXCEPTION: %s" % to_unicode(e))
-                    display.debug(u"WORKER TRACEBACK: %s" % to_unicode(traceback.format_exc()))
-
-        display.debug("WORKER PROCESS EXITING")
-
+                # ignore the real task result and don't allow result object contribution from the exception (in case the pickling error was related)
+                # also use a synthesized host and task object to avoid issues with values from them, particularly task_fields
+                self._final_q.send_task_result(host, task, utr)

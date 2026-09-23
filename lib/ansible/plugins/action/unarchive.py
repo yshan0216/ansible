@@ -15,13 +15,14 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 import os
 
+from ansible.errors import AnsibleActionFail
+from ansible.module_utils.parsing.convert_bool import boolean
+from ansible.module_utils.urls import mask_url
 from ansible.plugins.action import ActionBase
-from ansible.utils.boolean import boolean
 
 
 class ActionModule(ActionBase):
@@ -29,89 +30,81 @@ class ActionModule(ActionBase):
     TRANSFERS_FILES = True
 
     def run(self, tmp=None, task_vars=None):
-        ''' handler for unarchive operations '''
+        """ handler for unarchive operations """
         if task_vars is None:
             task_vars = dict()
 
-        result = super(ActionModule, self).run(tmp, task_vars)
+        super(ActionModule, self).run(tmp, task_vars)
+        del tmp  # tmp no longer has any effect
 
-        source  = self._task.args.get('src', None)
-        dest    = self._task.args.get('dest', None)
-        copy    = boolean(self._task.args.get('copy', True))
+        source = self._task.args.get('src', None)
+        dest = self._task.args.get('dest', None)
+        remote_src = boolean(self._task.args.get('remote_src', False), strict=False)
         creates = self._task.args.get('creates', None)
+        decrypt = self._task.args.get('decrypt', True)
 
-        if source is None or dest is None:
-            result['failed'] = True
-            result['msg'] = "src (or content) and dest are required"
-            return result
+        try:
+            # "copy" is deprecated in favor of "remote_src".
+            if 'copy' in self._task.args:
+                # They are mutually exclusive.
+                if 'remote_src' in self._task.args:
+                    raise AnsibleActionFail("parameters are mutually exclusive: ('copy', 'remote_src')")
+                # We will take the information from copy and store it in
+                # the remote_src var to use later in this file.
+                self._task.args['remote_src'] = remote_src = not boolean(self._task.args.pop('copy'), strict=False)
 
-        remote_user = task_vars.get('ansible_ssh_user') or self._play_context.remote_user
-        if not tmp:
-            tmp = self._make_tmp_path(remote_user)
-            self._cleanup_remote_tmp = True
+            if source is None or dest is None:
+                raise AnsibleActionFail("src (or content) and dest are required")
 
-        if creates:
-            # do not run the command if the line contains creates=filename
-            # and the filename already exists. This allows idempotence
-            # of command executions.
-            result = self._execute_module(module_name='stat', module_args=dict(path=creates), task_vars=task_vars)
-            stat = result.get('stat', None)
-            if stat and stat.get('exists', False):
-                result['skipped'] = True
-                result['msg'] = "skipped, since %s exists" % creates
-                self._remove_tmp_path(tmp)
-                return result
+            if creates:
+                # do not run the command if the line contains creates=filename
+                # and the filename already exists. This allows idempotence
+                # of command executions.
+                creates = self._remote_expand_user(creates)
+                if self._remote_file_exists(creates):
+                    return dict(
+                        msg=f'skipped, since {creates} exists',
+                        changed=False,
+                        skipped=True,  # deprecated: description='remove this skipped return', core_version='2.25'
+                    )
 
-        dest = self._remote_expand_user(dest) # CCTODO: Fix path for Windows hosts.
-        source = os.path.expanduser(source)
+            dest = self._remote_expand_user(dest)  # CCTODO: Fix path for Windows hosts.
 
-        if copy:
-            if self._task._role is not None:
-                source = self._loader.path_dwim_relative(self._task._role._role_path, 'files', source)
-            else:
-                source = self._loader.path_dwim_relative(self._loader.get_basedir(), 'files', source)
+            # if not remote, we need to get source at controller
+            if not remote_src:
+                if '://' in source:
+                    # TODO: implement using open_url?
+                    raise AnsibleActionFail(f"Unsupported option, an URI src ({mask_url(source)}) is only supported when remote_src is True")
+                else:
+                    source = os.path.expanduser(source)
+                    source = self._loader.get_real_file(self._find_needle('files', source), decrypt=decrypt)
 
-        remote_checksum = self._remote_checksum(dest, all_vars=task_vars, follow=True)
-        if remote_checksum == '4':
-            result['failed'] = True
-            result['msg'] = "python isn't present on the system.  Unable to compute checksum"
-            self._remove_tmp_path(tmp)
-            return result
-        elif remote_checksum != '3':
-            result['failed'] = True
-            result['msg'] = "dest '%s' must be an existing dir" % dest
-            self._remove_tmp_path(tmp)
-            return result
+            remote_stat = self._execute_remote_stat(dest, all_vars=task_vars, follow=True)
 
-        if copy:
-            # transfer the file to a remote tmp location
-            tmp_src = self._connection._shell.join_path(tmp, 'source')
-            self._transfer_file(source, tmp_src)
+            if not remote_stat['exists'] or not remote_stat['isdir']:
+                raise AnsibleActionFail("dest '%s' must be an existing dir" % dest)
 
-        # handle diff mode client side
-        # handle check mode client side
+            if not remote_src:
+                # transfer the file to a remote tmp location
+                tmp_src = self._connection._shell.join_path(self._connection._shell.tmpdir, 'source')
+                self._transfer_file(source, tmp_src)
 
-        if copy:
-            # fix file permissions when the copy is done as a different user
-            self._fixup_perms(tmp, remote_user, recursive=True)
-            # Build temporary module_args.
+            # handle diff mode client side
+            # handle check mode client side
+
+            # remove action plugin only keys
             new_module_args = self._task.args.copy()
-            new_module_args.update(
-                dict(
-                    src=tmp_src,
-                    original_basename=os.path.basename(source),
-                ),
-            )
+            for key in ('decrypt',):
+                if key in new_module_args:
+                    del new_module_args[key]
 
-        else:
-            new_module_args = self._task.args.copy()
-            new_module_args.update(
-                dict(
-                    original_basename=os.path.basename(source),
-                ),
-            )
+            if not remote_src:
+                # fix file permissions when the copy is done as a different user
+                self._fixup_perms2((self._connection._shell.tmpdir, tmp_src))
+                new_module_args['src'] = tmp_src
 
-        # execute the unarchive module now, with the updated args
-        result.update(self._execute_module(module_args=new_module_args, task_vars=task_vars))
-        self._remove_tmp_path(tmp)
-        return result
+            # execute the unarchive module now, with the updated args (using ansible.legacy prefix to eliminate collections
+            # collisions with local override
+            return self._execute_module(module_name='ansible.legacy.unarchive', module_args=new_module_args, task_vars=task_vars)
+        finally:
+            self._remove_tmp_path(self._connection._shell.tmpdir)

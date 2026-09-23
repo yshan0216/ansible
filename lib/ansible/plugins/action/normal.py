@@ -14,31 +14,36 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
+from ansible import constants as C
 from ansible.plugins.action import ActionBase
 from ansible.utils.vars import merge_hash
 
 
 class ActionModule(ActionBase):
 
+    _supports_check_mode = True
+    _supports_async = True
+
     def run(self, tmp=None, task_vars=None):
-        if task_vars is None:
-            task_vars = dict()
 
-        results = super(ActionModule, self).run(tmp, task_vars)
-        # remove as modules might hide due to nolog
-        del results['invocation']['module_args']
-        results = merge_hash(results, self._execute_module(tmp=tmp, task_vars=task_vars))
-        # Remove special fields from the result, which can only be set
-        # internally by the executor engine. We do this only here in
-        # the 'normal' action, as other action plugins may set this.
-        #
-        # We don't want modules to determine that running the module fires
-        # notify handlers.  That's for the playbook to decide.
-        for field in ('_ansible_notify',):
-            if field in results:
-                results.pop(field)
+        # individual modules might disagree but as the generic the action plugin, pass at this point.
+        result = super(ActionModule, self).run(tmp, task_vars)
+        del tmp  # tmp no longer has any effect
 
-        return results
+        wrap_async = self._task.async_val
+
+        # do work!
+        result = merge_hash(result, self._execute_module(task_vars=task_vars, wrap_async=wrap_async))
+
+        # hack to keep --verbose from showing all the setup module result
+        # moved from setup module as now we filter out all _ansible_ from result
+        if self._task.action in C._ACTION_SETUP:
+            result['_ansible_verbose_override'] = True
+
+        if not wrap_async:
+            # remove a temporary path we created
+            self._remove_tmp_path(self._connection._shell.tmpdir)
+
+        return result

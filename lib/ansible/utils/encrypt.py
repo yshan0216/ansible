@@ -1,151 +1,302 @@
 # (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+# (c) 2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+from __future__ import annotations
 
+import random
+import secrets
+import string
 
-import os
-import stat
-import tempfile
-import multiprocessing
-import time
-import warnings
-
-PASSLIB_AVAILABLE = False
-try:
-    import passlib.hash
-    PASSLIB_AVAILABLE = True
-except:
-    pass
-
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
-
-KEYCZAR_AVAILABLE=False
-try:
-    try:
-        # some versions of pycrypto may not have this?
-        from Crypto.pct_warnings import PowmInsecureWarning
-    except ImportError:
-        PowmInsecureWarning = RuntimeWarning
-
-    with warnings.catch_warnings(record=True) as warning_handler:
-        warnings.simplefilter("error", PowmInsecureWarning)
-        try:
-            import keyczar.errors as key_errors
-            from keyczar.keys import AesKey
-        except PowmInsecureWarning:
-            display.system_warning(
-                "The version of gmp you have installed has a known issue regarding " + \
-                "timing vulnerabilities when used with pycrypto. " + \
-                "If possible, you should update it (i.e. yum update gmp)."
-            )
-            warnings.resetwarnings()
-            warnings.simplefilter("ignore")
-            import keyczar.errors as key_errors
-            from keyczar.keys import AesKey
-        KEYCZAR_AVAILABLE=True
-except ImportError:
-    pass
+from dataclasses import dataclass
 
 from ansible import constants as C
-from ansible.errors import AnsibleError
+from ansible.errors import AnsibleError, AnsibleAssertionError
+from ansible.module_utils.common.text.converters import to_text, to_bytes
+from ansible.utils.display import Display
+
+PASSLIB_E = None
+PASSLIB_AVAILABLE = False
+
+try:
+    import passlib
+    import passlib.hash
+    from passlib.utils.handlers import HasRawSalt, PrefixWrapper
+    try:
+        from passlib.utils.binary import bcrypt64
+    except ImportError:
+        from passlib.utils import bcrypt64
+
+    PASSLIB_AVAILABLE = True
+except Exception as e:
+    PASSLIB_E = e
+
+CRYPT_E = None
+HAS_CRYPT = False
+try:
+    from ansible._internal._encryption._crypt import CryptFacade
+    _crypt_facade = CryptFacade()
+    HAS_CRYPT = True
+except Exception as e:
+    CRYPT_E = e
+
+
+display = Display()
 
 __all__ = ['do_encrypt']
 
-_LOCK = multiprocessing.Lock()
+DEFAULT_PASSWORD_LENGTH = 20
 
 
-def do_encrypt(result, encrypt, salt_size=None, salt=None):
-    if PASSLIB_AVAILABLE:
-        try:
-            crypt = getattr(passlib.hash, encrypt)
-        except:
-            raise AnsibleError("passlib does not support '%s' algorithm" % encrypt)
+def random_password(length=DEFAULT_PASSWORD_LENGTH, chars=C.DEFAULT_PASSWORD_CHARS, seed=None):
+    """Return a random password string of length containing only chars
 
-        if salt_size:
-            result = crypt.encrypt(result, salt_size=salt_size)
-        elif salt:
-            result = crypt.encrypt(result, salt=salt)
-        else:
-            result = crypt.encrypt(result)
+    :kwarg length: The number of characters in the new password.  Defaults to 20.
+    :kwarg chars: The characters to choose from.  The default is all ascii
+        letters, ascii digits, and these symbols ``.,:-_``
+    """
+    if not isinstance(chars, str):
+        raise AnsibleAssertionError(f'{chars=!r} ({type(chars)}) is not a {type(str)}.')
+
+    if seed is None:
+        random_generator = secrets.SystemRandom()
     else:
-        raise AnsibleError("passlib must be installed to encrypt vars_prompt values")
+        random_generator = random.Random(seed)
 
-    return result
+    return u''.join(random_generator.choice(chars) for dummy in range(length))
 
-def key_for_hostname(hostname):
-    # fireball mode is an implementation of ansible firing up zeromq via SSH
-    # to use no persistent daemons or key management
 
-    if not KEYCZAR_AVAILABLE:
-        raise AnsibleError("python-keyczar must be installed on the control machine to use accelerated modes")
+_SALT_CHARS = string.ascii_letters + string.digits + './'
+_VALID_SALT_CHARS = frozenset(_SALT_CHARS)
 
-    key_path = os.path.expanduser(C.ACCELERATE_KEYS_DIR)
-    if not os.path.exists(key_path):
-        # avoid race with multiple forks trying to create paths on host
-        # but limit when locking is needed to creation only
-        with(_LOCK):
-            if not os.path.exists(key_path):
-                # use a temp directory and rename to ensure the directory
-                # searched for only appears after permissions applied.
-                tmp_dir = tempfile.mkdtemp(dir=os.path.dirname(key_path))
-                os.chmod(tmp_dir, int(C.ACCELERATE_KEYS_DIR_PERMS, 8))
-                os.rename(tmp_dir, key_path)
-    elif not os.path.isdir(key_path):
-        raise AnsibleError('ACCELERATE_KEYS_DIR is not a directory.')
 
-    if stat.S_IMODE(os.stat(key_path).st_mode) != int(C.ACCELERATE_KEYS_DIR_PERMS, 8):
-        raise AnsibleError('Incorrect permissions on the private key directory. Use `chmod 0%o %s` to correct this issue, and make sure any of the keys files contained within that directory are set to 0%o' % (int(C.ACCELERATE_KEYS_DIR_PERMS, 8), C.ACCELERATE_KEYS_DIR, int(C.ACCELERATE_KEYS_FILE_PERMS, 8)))
+def random_salt(length=8):
+    """Return a text string suitable for use as a salt for the hash functions we use to encrypt passwords.
+    """
+    # Note passlib salt values must be pure ascii so we can't let the user
+    # configure this
+    return random_password(length=length, chars=_SALT_CHARS)
 
-    key_path = os.path.join(key_path, hostname)
 
-    # use new AES keys every 2 hours, which means fireball must not allow running for longer either
-    if not os.path.exists(key_path) or (time.time() - os.path.getmtime(key_path) > 60*60*2):
-        # avoid race with multiple forks trying to create key
-        # but limit when locking is needed to creation only
-        with(_LOCK):
-            if not os.path.exists(key_path) or (time.time() - os.path.getmtime(key_path) > 60*60*2):
-                key = AesKey.Generate()
-                # use temp file to ensure file only appears once it has
-                # desired contents and permissions
-                with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(key_path), delete=False) as fh:
-                    tmp_key_path = fh.name
-                    fh.write(str(key))
-                os.chmod(tmp_key_path, int(C.ACCELERATE_KEYS_FILE_PERMS, 8))
-                os.rename(tmp_key_path, key_path)
-                return key
+@dataclass(frozen=True)
+class _Algo:
+    crypt_id: str
+    salt_size: int
+    implicit_rounds: int | None = None
+    salt_exact: bool = False
+    implicit_ident: str | None = None
+    rounds_format: str | None = None
+    requires_gensalt: bool = False
 
-    if stat.S_IMODE(os.stat(key_path).st_mode) != int(C.ACCELERATE_KEYS_FILE_PERMS, 8):
-        raise AnsibleError('Incorrect permissions on the key file for this host. Use `chmod 0%o %s` to correct this issue.' % (int(C.ACCELERATE_KEYS_FILE_PERMS, 8), key_path))
-    fh = open(key_path)
-    key = AesKey.Read(fh.read())
-    fh.close()
-    return key
 
-def keyczar_encrypt(key, msg):
-    return key.Encrypt(msg.encode('utf-8'))
+class BaseHash(object):
+    algorithms = {
+        'md5_crypt': _Algo(crypt_id='1', salt_size=8),
+        'bcrypt': _Algo(crypt_id='2b', salt_size=22, implicit_rounds=12, salt_exact=True, implicit_ident='2b', rounds_format='cost'),
+        'sha256_crypt': _Algo(crypt_id='5', salt_size=16, implicit_rounds=535000, rounds_format='rounds'),
+        'sha512_crypt': _Algo(crypt_id='6', salt_size=16, implicit_rounds=656000, rounds_format='rounds'),
+    }
 
-def keyczar_decrypt(key, msg):
-    try:
-        return key.Decrypt(msg)
-    except key_errors.InvalidSignatureError:
-        raise AnsibleError("decryption failed")
+    def __init__(self, algorithm):
+        self.algorithm = algorithm
+        display.vv(f"Using {self.__class__.__name__} to hash input with {algorithm!r}")
 
+
+class CryptHash(BaseHash):
+    algorithms = {
+        **BaseHash.algorithms,
+        'yescrypt': _Algo(crypt_id='y', salt_size=16, implicit_rounds=5, rounds_format='cost', requires_gensalt=True, salt_exact=True),
+    }
+
+    def __init__(self, algorithm: str) -> None:
+        super(CryptHash, self).__init__(algorithm)
+
+        if not HAS_CRYPT:
+            raise AnsibleError("crypt cannot be used as the 'libxcrypt' library is not installed or is unusable.") from CRYPT_E
+
+        if algorithm not in self.algorithms:
+            raise AnsibleError(f"crypt does not support {self.algorithm!r} algorithm")
+
+        self.algo_data = self.algorithms[algorithm]
+
+        if self.algo_data.requires_gensalt and not _crypt_facade.has_crypt_gensalt:
+            raise AnsibleError(f"{self.algorithm!r} algorithm requires libxcrypt")
+
+    def hash(self, secret: str, salt: str | None = None, salt_size: int | None = None, rounds: int | None = None, ident: str | None = None) -> str:
+        rounds = self._rounds(rounds)
+        ident = self._ident(ident)
+
+        if _crypt_facade.has_crypt_gensalt:
+            saltstring = self._gensalt(ident, rounds, salt, salt_size)
+        else:
+            saltstring = self._build_saltstring(ident, rounds, salt, salt_size)
+
+        return self._hash(secret, saltstring)
+
+    def _validate_salt_size(self, salt_size: int | None) -> int:
+        if salt_size is not None and not isinstance(salt_size, int):
+            raise TypeError('salt_size must be an integer')
+        salt_size = salt_size or self.algo_data.salt_size
+        if self.algo_data.salt_exact and salt_size != self.algo_data.salt_size:
+            raise AnsibleError(f"invalid salt size supplied ({salt_size}), expected {self.algo_data.salt_size}")
+        elif not self.algo_data.salt_exact and salt_size > self.algo_data.salt_size:
+            raise AnsibleError(f"invalid salt size supplied ({salt_size}), expected at most {self.algo_data.salt_size}")
+        return salt_size
+
+    def _salt(self, salt: str | None, salt_size: int | None) -> str:
+        salt_size = self._validate_salt_size(salt_size)
+        ret = salt or random_salt(salt_size)
+        if not set(ret).issubset(_VALID_SALT_CHARS):
+            raise AnsibleError("invalid characters in salt")
+        if self.algo_data.salt_exact and len(ret) != self.algo_data.salt_size:
+            raise AnsibleError(f"invalid salt size supplied ({len(ret)}), expected {self.algo_data.salt_size}")
+        elif not self.algo_data.salt_exact and len(ret) > self.algo_data.salt_size:
+            raise AnsibleError(f"invalid salt size supplied ({len(ret)}), expected at most {self.algo_data.salt_size}")
+        return ret
+
+    def _rounds(self, rounds: int | None) -> int | None:
+        return rounds or self.algo_data.implicit_rounds
+
+    def _ident(self, ident: str | None) -> str | None:
+        return ident or self.algo_data.crypt_id
+
+    def _gensalt(self, ident: str, rounds: int | None, salt: str | None, salt_size: int | None) -> str:
+        if salt is None:
+            salt_size = self._validate_salt_size(salt_size)
+            rbytes = secrets.token_bytes(salt_size)
+        else:
+            salt = self._salt(salt, salt_size)
+            rbytes = to_bytes(salt)
+
+        prefix = f'${ident}$'
+        count = rounds or 0
+
+        try:
+            salt_bytes = _crypt_facade.crypt_gensalt(to_bytes(prefix), count, rbytes)
+            return to_text(salt_bytes, errors='strict')
+        except (NotImplementedError, ValueError) as e:
+            raise AnsibleError(f"Failed to generate salt for {self.algorithm!r} algorithm") from e
+
+    def _build_saltstring(self, ident: str, rounds: int | None, salt: str | None, salt_size: int | None) -> str:
+        salt = self._salt(salt, salt_size)
+        saltstring = f'${ident}' if ident else ''
+        if rounds:
+            if self.algo_data.rounds_format == 'cost':
+                # musl libc requires a 2-digit bcrypt cost ($2b$05$, not $2b$5$).
+                saltstring += f'${rounds:02d}'
+            else:
+                saltstring += f'$rounds={rounds}'
+        saltstring += f'${salt}'
+        return saltstring
+
+    def _hash(self, secret: str, saltstring: str) -> str:
+        try:
+            result = _crypt_facade.crypt(to_bytes(secret), to_bytes(saltstring))
+        except (OSError, ValueError) as e:
+            raise AnsibleError(f"crypt does not support {self.algorithm!r} algorithm") from e
+
+        return to_text(result, errors='strict')
+
+
+class PasslibHash(BaseHash):
+    def __init__(self, algorithm):
+        super(PasslibHash, self).__init__(algorithm)
+
+        if not PASSLIB_AVAILABLE:
+            raise AnsibleError(f"The passlib Python package must be installed to hash with the {algorithm!r} algorithm.") from PASSLIB_E
+
+        try:
+            self.crypt_algo = getattr(passlib.hash, algorithm)
+        except Exception:
+            raise AnsibleError(f"Installed passlib version {passlib.__version__} does not support the {algorithm!r} algorithm.") from None
+
+    def hash(self, secret, salt=None, salt_size=None, rounds=None, ident=None):
+        salt = self._clean_salt(salt)
+        rounds = self._clean_rounds(rounds)
+        ident = self._clean_ident(ident)
+        if salt_size is not None and not isinstance(salt_size, int):
+            raise TypeError("salt_size must be an integer")
+        return self._hash(secret, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+
+    def _clean_ident(self, ident):
+        ret = None
+        if not ident:
+            if self.algorithm in self.algorithms:
+                return self.algorithms.get(self.algorithm).implicit_ident
+            return ret
+        if self.algorithm == 'bcrypt':
+            return ident
+        return ret
+
+    def _clean_salt(self, salt):
+        if not salt:
+            return None
+        elif issubclass(self.crypt_algo.wrapped if isinstance(self.crypt_algo, PrefixWrapper) else self.crypt_algo, HasRawSalt):
+            ret = to_bytes(salt, encoding='ascii', errors='strict')
+        else:
+            ret = to_text(salt, encoding='ascii', errors='strict')
+
+        # Ensure the salt has the correct padding
+        if self.algorithm == 'bcrypt':
+            ret = bcrypt64.repair_unused(ret)
+
+        return ret
+
+    def _clean_rounds(self, rounds):
+        algo_data = self.algorithms.get(self.algorithm)
+        if rounds:
+            return rounds
+        elif algo_data and algo_data.implicit_rounds:
+            # The default rounds used by passlib depend on the passlib version.
+            # For consistency ensure that passlib behaves the same as crypt in case no rounds were specified.
+            # Thus use the crypt defaults.
+            return algo_data.implicit_rounds
+        else:
+            return None
+
+    def _hash(self, secret, salt, salt_size, rounds, ident):
+        # Not every hash algorithm supports every parameter.
+        # Thus create the settings dict only with set parameters.
+        settings = {}
+        if salt:
+            settings['salt'] = salt
+        if salt_size:
+            settings['salt_size'] = salt_size
+        if rounds:
+            settings['rounds'] = rounds
+        if ident:
+            settings['ident'] = ident
+
+        # starting with passlib 1.7 'using' and 'hash' should be used instead of 'encrypt'
+        try:
+            if hasattr(self.crypt_algo, 'hash'):
+                result = self.crypt_algo.using(**settings).hash(secret)
+            elif hasattr(self.crypt_algo, 'encrypt'):
+                result = self.crypt_algo.encrypt(secret, **settings)
+            else:
+                raise ValueError(f"Installed passlib version {passlib.__version__} is not supported.")
+        except ValueError as ex:
+            raise AnsibleError("Could not hash the secret.") from ex
+
+        # passlib.hash should always return something or raise an exception.
+        # Still ensure that there is always a result.
+        # Otherwise an empty password might be assumed by some modules, like the user module.
+        if not result:
+            raise AnsibleError(f"Failed to hash with passlib using the {self.algorithm!r} algorithm.")
+
+        # Hashes from passlib.hash should be represented as ascii strings of hex
+        # digits so this should not traceback.  If it's not representable as such
+        # we need to traceback and then block such algorithms because it may
+        # impact calling code.
+        return to_text(result, errors='strict')
+
+
+def do_encrypt(result, algorithm, salt_size=None, salt=None, ident=None, rounds=None):
+    if HAS_CRYPT and algorithm in CryptHash.algorithms:
+        return CryptHash(algorithm).hash(result, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+    elif PASSLIB_AVAILABLE:
+        # TODO: deprecate passlib
+        return PasslibHash(algorithm).hash(result, salt=salt, salt_size=salt_size, rounds=rounds, ident=ident)
+    elif not PASSLIB_AVAILABLE and algorithm not in CryptHash.algorithms:
+        # When passlib support is removed, this branch can be removed too
+        raise AnsibleError(f"crypt does not support {algorithm!r} algorithm")
+    raise AnsibleError("Unable to encrypt nor hash, either libxcrypt (recommended), crypt, or passlib must be installed.") from CRYPT_E

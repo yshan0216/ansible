@@ -1,160 +1,180 @@
 # -*- coding: utf-8 -*-
-# (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# Copyright (c) 2015-2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division)
-__metaclass__ = type
+from __future__ import annotations
 
-import copy
 import json
 import sys
+import datetime
+import typing as t
 
-from ansible.compat.tests import unittest
-from units.mock.procenv import swap_stdin_and_argv, swap_stdout
+import pytest
+import pytest_mock
 
-from ansible.module_utils import basic
+EMPTY_INVOCATION: dict[str, dict[str, t.Any]] = {u'module_args': {}}
+DATETIME = datetime.datetime.strptime('2020-07-13 12:50:00', '%Y-%m-%d %H:%M:%S')
+
+pytestmark = pytest.mark.usefixtures("module_env_mocker")
 
 
-empty_invocation = {u'module_args': {}}
+class TestAnsibleModuleExitJson:
+    """
+    Test that various means of calling exitJson and FailJson return the messages they've been given
+    """
+    DATA: tuple[tuple[dict[str, t.Any]], ...] = (
+        ({}, {'invocation': EMPTY_INVOCATION}),
+        ({'msg': 'message'}, {'msg': 'message', 'invocation': EMPTY_INVOCATION}),
+        ({'msg': 'success', 'changed': True},
+         {'msg': 'success', 'changed': True, 'invocation': EMPTY_INVOCATION}),
+        ({'msg': 'nochange', 'changed': False},
+         {'msg': 'nochange', 'changed': False, 'invocation': EMPTY_INVOCATION}),
+        ({'msg': 'message', 'date': DATETIME.date()},
+         {'msg': 'message', 'date': DATETIME.date().isoformat(), 'invocation': EMPTY_INVOCATION}),
+        ({'msg': 'message', 'datetime': DATETIME},
+         {'msg': 'message', 'datetime': DATETIME.isoformat(), 'invocation': EMPTY_INVOCATION}),
+    )
 
-@unittest.skipIf(sys.version_info[0] >= 3, "Python 3 is not supported on targets (yet)")
-class TestAnsibleModuleExitJson(unittest.TestCase):
-    def setUp(self):
-        args = json.dumps(dict(ANSIBLE_MODULE_ARGS={}))
-        self.stdin_swap_ctx = swap_stdin_and_argv(stdin_data=args)
-        self.stdin_swap_ctx.__enter__()
+    @pytest.mark.parametrize('args, expected, stdin', [(a, e, {}) for a, e in DATA], indirect=['stdin'])
+    def test_exit_json_exits(self, am, capfd, args, expected):
+        with pytest.raises(SystemExit) as ctx:
+            am.exit_json(**args)
+        assert ctx.value.code == 0
 
-        # since we can't use context managers and "with" without overriding run(), call them directly
-        self.stdout_swap_ctx = swap_stdout()
-        self.fake_stream = self.stdout_swap_ctx.__enter__()
+        out, err = capfd.readouterr()
+        return_val = json.loads(out)
+        assert return_val == expected
 
-        basic._ANSIBLE_ARGS = None
-        self.module = basic.AnsibleModule(argument_spec=dict())
+    @pytest.mark.parametrize('args, expected, stdin',
+                             [(a, e, {}) for a, e in DATA if 'msg' in a],
+                             indirect=['stdin'])
+    def test_fail_json_exits(self, am, capfd, args, expected):
+        with pytest.raises(SystemExit) as ctx:
+            am.fail_json(**args)
+        assert ctx.value.code == 1
 
-    def tearDown(self):
-        # since we can't use context managers and "with" without overriding run(), call them directly to clean up
-        self.stdin_swap_ctx.__exit__(None, None, None)
-        self.stdout_swap_ctx.__exit__(None, None, None)
+        out, err = capfd.readouterr()
+        return_val = json.loads(out)
+        # Fail_json should add failed=True
+        expected['failed'] = True
+        assert return_val == expected
 
-    def test_exit_json_no_args_exits(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.module.exit_json()
-        if isinstance(ctx.exception, int):
-            # Python2.6... why does sys.exit behave this way?
-            self.assertEquals(ctx.exception, 0)
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_fail_json_msg_positional(self, am, capfd):
+        with pytest.raises(SystemExit) as ctx:
+            am.fail_json('This is the msg')
+        assert ctx.value.code == 1
+
+        out, err = capfd.readouterr()
+        return_val = json.loads(out)
+        # Fail_json should add failed=True
+        assert return_val == {'msg': 'This is the msg', 'failed': True,
+                              'invocation': EMPTY_INVOCATION}
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_fail_json_msg_as_kwarg_after(self, am, capfd):
+        """Test that msg as a kwarg after other kwargs works"""
+        with pytest.raises(SystemExit) as ctx:
+            am.fail_json(arbitrary=42, msg='This is the msg')
+        assert ctx.value.code == 1
+
+        out, err = capfd.readouterr()
+        return_val = json.loads(out)
+        # Fail_json should add failed=True
+        assert return_val == {'msg': 'This is the msg', 'failed': True,
+                              'arbitrary': 42,
+                              'invocation': EMPTY_INVOCATION}
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_fail_json_no_msg(self, am):
+        with pytest.raises(TypeError) as ctx:
+            am.fail_json()
+
+        if sys.version_info >= (3, 10):
+            error_msg = "AnsibleModule.fail_json() missing 1 required positional argument: 'msg'"
         else:
-            self.assertEquals(ctx.exception.code, 0)
-        return_val = json.loads(self.fake_stream.getvalue())
-        self.assertEquals(return_val, dict(changed=False, invocation=empty_invocation))
+            error_msg = "fail_json() missing 1 required positional argument: 'msg'"
 
-    def test_exit_json_args_exits(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.module.exit_json(msg='message')
-        if isinstance(ctx.exception, int):
-            # Python2.6... why does sys.exit behave this way?
-            self.assertEquals(ctx.exception, 0)
-        else:
-            self.assertEquals(ctx.exception.code, 0)
-        return_val = json.loads(self.fake_stream.getvalue())
-        self.assertEquals(return_val, dict(msg="message", changed=False, invocation=empty_invocation))
+        assert ctx.value.args[0] == error_msg
 
-    def test_fail_json_exits(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.module.fail_json(msg='message')
-        if isinstance(ctx.exception, int):
-            # Python2.6... why does sys.exit behave this way?
-            self.assertEquals(ctx.exception, 1)
-        else:
-            self.assertEquals(ctx.exception.code, 1)
-        return_val = json.loads(self.fake_stream.getvalue())
-        self.assertEquals(return_val, dict(msg="message", failed=True, invocation=empty_invocation))
 
-    def test_exit_json_proper_changed(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self.module.exit_json(changed=True, msg='success')
-        return_val = json.loads(self.fake_stream.getvalue())
-        self.assertEquals(return_val, dict(changed=True, msg='success', invocation=empty_invocation))
+class TestAnsibleModuleExitNewSecretsProvided:
+    """
+    Test that ExitJson and FailJson provide the newly registered secrets
+    """
 
-@unittest.skipIf(sys.version_info[0] >= 3, "Python 3 is not supported on targets (yet)")
-class TestAnsibleModuleExitValuesRemoved(unittest.TestCase):
-    OMIT = 'VALUE_SPECIFIED_IN_NO_LOG_PARAMETER'
-    dataset = (
-            (dict(username='person', password='$ecret k3y'),
-                dict(one=1, pwd='$ecret k3y', url='https://username:password12345@foo.com/login/',
-                    not_secret='following the leader', msg='here'),
-                dict(one=1, pwd=OMIT, url='https://username:password12345@foo.com/login/',
-                    not_secret='following the leader', changed=False, msg='here',
-                    invocation=dict(module_args=dict(password=OMIT, token=None, username='person'))),
-                ),
-            (dict(username='person', password='password12345'),
-                dict(one=1, pwd='$ecret k3y', url='https://username:password12345@foo.com/login/',
-                    not_secret='following the leader', msg='here'),
-                dict(one=1, pwd='$ecret k3y', url='https://username:********@foo.com/login/',
-                    not_secret='following the leader', changed=False, msg='here',
-                    invocation=dict(module_args=dict(password=OMIT, token=None, username='person'))),
-                ),
-            (dict(username='person', password='$ecret k3y'),
-                dict(one=1, pwd='$ecret k3y', url='https://username:$ecret k3y@foo.com/login/',
-                    not_secret='following the leader', msg='here'),
-                dict(one=1, pwd=OMIT, url='https://username:********@foo.com/login/',
-                    not_secret='following the leader', changed=False, msg='here',
-                    invocation=dict(module_args=dict(password=OMIT, token=None, username='person'))),
-                ),
-            )
+    DATA = (
+        (
+            dict(username='person', password='$secret k3y'),
+            dict(one=1, pwd='$secret k3y', url='https://username:password12345@foo.com/login/',
+                 not_secret='following the leader', msg='here'),
+            dict(one=1, pwd='$secret k3y', url='https://username:password12345@foo.com/login/',
+                 not_secret='following the leader', msg='here',
+                 invocation=dict(module_args=dict(password='$secret k3y', token=None, username='person')),
+                 _ansible_new_secrets=['$secret k3y']),
+        ),
+        (
+            dict(username='person', password='password12345'),
+            dict(one=1, pwd='$secret k3y', url='https://username:password12345@foo.com/login/',
+                 not_secret='following the leader', msg='here'),
+            dict(one=1, pwd='$secret k3y', url='https://username:password12345@foo.com/login/',
+                 not_secret='following the leader', msg='here',
+                 invocation=dict(module_args=dict(password='password12345', token=None, username='person')),
+                 _ansible_new_secrets=['password12345']),
+        ),
+        (
+            dict(username='person', password='$secret k3y'),
+            dict(one=1, pwd='$secret k3y', url='https://username:$secret k3y@foo.com/login/',
+                 not_secret='following the leader', msg='here'),
+            dict(one=1, pwd='$secret k3y', url='https://username:$secret k3y@foo.com/login/',
+                 not_secret='following the leader', msg='here',
+                 invocation=dict(module_args=dict(password='$secret k3y', token=None, username='person')),
+                 _ansible_new_secrets=['$secret k3y']),
+        ),
+    )
 
-    def test_exit_json_removes_values(self):
-        self.maxDiff = None
-        for args, return_val, expected in self.dataset:
-            params = dict(ANSIBLE_MODULE_ARGS=args)
-            params = json.dumps(params)
+    @pytest.mark.parametrize('am, stdin, return_val, expected',
+                             [({'username': {}, 'password': {'no_log': True}, 'token': {'no_log': True}}, s, r, e)
+                              for s, r, e in DATA],
+                             indirect=['am', 'stdin'])
+    def test_exit_json_removes_values(self, am, capfd, return_val, expected):
+        with pytest.raises(SystemExit):
+            am.exit_json(**return_val)
+        out, err = capfd.readouterr()
 
-            with swap_stdin_and_argv(stdin_data=params):
-                with swap_stdout():
-                    basic._ANSIBLE_ARGS = None
-                    module = basic.AnsibleModule(
-                        argument_spec = dict(
-                            username=dict(),
-                            password=dict(no_log=True),
-                            token=dict(no_log=True),
-                            ),
-                        )
-                    with self.assertRaises(SystemExit) as ctx:
-                        self.assertEquals(module.exit_json(**return_val), expected)
-                    self.assertEquals(json.loads(sys.stdout.getvalue()), expected)
+        assert json.loads(out) == expected
 
-    def test_fail_json_removes_values(self):
-        self.maxDiff = None
-        for args, return_val, expected in self.dataset:
-            expected = copy.deepcopy(expected)
-            del expected['changed']
-            expected['failed'] = True
-            params = dict(ANSIBLE_MODULE_ARGS=args)
-            params = json.dumps(params)
-            with swap_stdin_and_argv(stdin_data=params):
-                with swap_stdout():
-                    basic._ANSIBLE_ARGS = None
-                    module = basic.AnsibleModule(
-                        argument_spec = dict(
-                            username=dict(),
-                            password=dict(no_log=True),
-                            token=dict(no_log=True),
-                            ),
-                        )
-                    with self.assertRaises(SystemExit) as ctx:
-                        self.assertEquals(module.fail_json(**return_val), expected)
-                    self.assertEquals(json.loads(sys.stdout.getvalue()), expected)
+    @pytest.mark.parametrize('am, stdin, return_val, expected',
+                             [({'username': {}, 'password': {'no_log': True}, 'token': {'no_log': True}}, s, r, e)
+                              for s, r, e in DATA],
+                             indirect=['am', 'stdin'])
+    def test_fail_json_removes_values(self, am, capfd, return_val, expected):
+        expected['failed'] = True
+        with pytest.raises(SystemExit):
+            am.fail_json(**return_val)
+        out, err = capfd.readouterr()
+
+        assert json.loads(out) == expected
+
+    def test_record_module_result(self, mocker: pytest_mock.MockerFixture, stdin) -> None:
+        """Ensure that the temporary _record_module_result hook is called correctly."""
+        recorded_result = None
+
+        expected_result = dict(changed=False, worked="yay")
+
+        def _record_module_result(_self, o: object) -> None:
+            assert isinstance(o, dict)
+
+            nonlocal recorded_result
+            recorded_result = o
+
+        from ansible.module_utils.basic import AnsibleModule
+
+        mocker.patch.object(AnsibleModule, '_record_module_result', _record_module_result)
+
+        am = AnsibleModule(argument_spec=dict())
+
+        with pytest.raises(SystemExit):
+            am.exit_json(**expected_result)
+
+        assert expected_result.items() <= recorded_result.items()

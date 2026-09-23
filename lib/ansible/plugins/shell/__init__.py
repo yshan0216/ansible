@@ -1,188 +1,254 @@
 # (c) 2016 RedHat
-#
-# This file is part of Ansible.
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
+from __future__ import annotations
 
-import os
+import dataclasses
 import re
-import pipes
-import ansible.constants as C
-import time
-import random
+import shlex
+import uuid
 
-from ansible.compat.six import text_type
+from os.path import isabs, basename, join as path_join
+
+from ansible.errors import AnsibleError
+from ansible.module_utils.common.text.converters import to_native
+from ansible.plugins import AnsiblePlugin
+from ansible.utils.display import Display
+
+display = Display()
 
 _USER_HOME_PATH_RE = re.compile(r'^~[_.A-Za-z0-9][-_.A-Za-z0-9]*$')
 
-class ShellBase(object):
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class _ShellCommand:
+    """Internal type returned by shell subsystems that may require both an execution payload and a command (eg powershell)."""
+    command: str
+    input_data: bytes | None = None
+
+
+class ShellBase(AnsiblePlugin):
 
     def __init__(self):
-        self.env = dict()
-        if C.DEFAULT_MODULE_SET_LOCALE:
-            self.env.update(
-                dict(
-                    LANG        = C.DEFAULT_MODULE_LANG,
-                    LC_ALL      = C.DEFAULT_MODULE_LANG,
-                    LC_MESSAGES = C.DEFAULT_MODULE_LANG,
-                )
-            )
 
-    def env_prefix(self, **kwargs):
-        env = self.env.copy()
-        env.update(kwargs)
-        return ' '.join(['%s=%s' % (k, pipes.quote(text_type(v))) for k,v in env.items()])
+        super(ShellBase, self).__init__()
 
-    def join_path(self, *args):
-        return os.path.join(*args)
+        # Not used but here for backwards compatibility.
+        # ansible.posix.fish uses (but does not actually use) this value.
+        # https://github.com/ansible-collections/ansible.posix/blob/f41f08e9e3d3129e709e122540b5ae6bc19932be/plugins/shell/fish.py#L38-L39
+        self.env = {}
+        self.tmpdir = None
+        self.executable = None
+
+    def _normalize_system_tmpdirs(self):
+        # Normalize the tmp directory strings. We don't use expanduser/expandvars because those
+        # can vary between remote user and become user.  Therefore the safest practice will be for
+        # this to always be specified as full paths)
+        normalized_paths = [d.rstrip('/') for d in self.get_option('system_tmpdirs')]
+
+        # Make sure all system_tmpdirs are absolute otherwise they'd be relative to the login dir
+        # which is almost certainly going to fail in a cornercase.
+        if not all(isabs(d) for d in normalized_paths):
+            raise AnsibleError(f'The configured system_tmpdirs contains a relative path: {normalized_paths}. All system_tmpdirs must be absolute')
+
+        self.set_option('system_tmpdirs', normalized_paths)
+
+    def set_options(self, task_keys=None, var_options=None, direct=None):
+
+        super(ShellBase, self).set_options(task_keys=task_keys, var_options=var_options, direct=direct)
+
+        # We can remove the try: except in the future when we make ShellBase a proper subset of
+        # *all* shells.  Right now powershell and third party shells which do not use the
+        # shell_common documentation fragment (and so do not have system_tmpdirs) will fail
+        try:
+            self._normalize_system_tmpdirs()
+        except KeyError:
+            pass
+
+    @staticmethod
+    def _generate_temp_dir_name() -> str:
+        return f'ansible-tmp-{uuid.uuid4()}'
+
+    def env_prefix(self, **kwargs) -> str:
+        return ' '.join([f'{k}={self.quote(str(v))}' for k, v in kwargs.items()])
+
+    def join_path(self, *args) -> str:
+        return path_join(*args)
 
     # some shells (eg, powershell) are snooty about filenames/extensions, this lets the shell plugin have a say
-    def get_remote_filename(self, pathname):
-        base_name = os.path.basename(pathname.strip())
-        return base_name.strip()
+    def get_remote_filename(self, pathname: str) -> str:
+        return basename(pathname.strip())
 
-    def path_has_trailing_slash(self, path):
+    def path_has_trailing_slash(self, path: str) -> bool:
         return path.endswith('/')
 
-    def chmod(self, mode, path, recursive=True):
-        path = pipes.quote(path)
-        cmd = ['chmod']
+    def chmod(self, paths: list[str], mode: str) -> str:
+        cmd = ['chmod', mode]
+        cmd.extend(paths)
+        return self.join(cmd)
 
-        if recursive:
-            cmd.append('-R') # many chmods require -R before file list
+    def chown(self, paths: list[str], user: str) -> str:
+        cmd = ['chown', user]
+        cmd.extend(paths)
+        return self.join(cmd)
 
-        cmd.extend([mode, path])
+    def chgrp(self, paths: list[str], group: str) -> str:
+        cmd = ['chgrp', group]
+        cmd.extend(paths)
+        return self.join(cmd)
 
-        return ' '.join(cmd)
-
-    def chown(self, path, user, group=None, recursive=True):
-        path = pipes.quote(path)
-        user = pipes.quote(user)
-
-        cmd = ['chown']
-
-        if recursive:
-            cmd.append('-R') # many chowns require -R before file list
-
-        if group is None:
-            cmd.extend([user, path])
-        else:
-            group = pipes.quote(group)
-            cmd.extend(['%s:%s' % (user, group), path])
-
-        return ' '.join(cmd)
-
-    def set_user_facl(self, path, user, mode, recursive=True):
+    def set_user_facl(self, paths: list[str], user: str, mode: str) -> str:
         """Only sets acls for users as that's really all we need"""
-        path = pipes.quote(path)
-        mode = pipes.quote(mode)
-        user = pipes.quote(user)
+        cmd = ['setfacl', '-m', f'u:{user}:{mode}']
+        cmd.extend(paths)
+        return self.join(cmd)
 
-        cmd = ['setfacl']
-        if recursive:
-            cmd.append('-R')
-        cmd.extend(('-m', 'u:%s:%s %s' % (user, mode, path)))
-
-        return ' '.join(cmd)
-
-    def remove(self, path, recurse=False):
-        path = pipes.quote(path)
-        cmd = 'rm -f '
+    def remove(self, path: str, recurse: bool = False) -> str:
+        cmd = ['rm', '-f']
         if recurse:
-            cmd += '-r '
-        return cmd + "%s %s" % (path, self._SHELL_REDIRECT_ALLNULL)
-
-    def exists(self, path):
-        cmd = ['test', '-e', pipes.quote(path)]
+            cmd.append('-r')
+        cmd.extend([self.quote(path), self._SHELL_REDIRECT_ALLNULL])
         return ' '.join(cmd)
 
-    def mkdtemp(self, basefile=None, system=False, mode=None):
+    def exists(self, path: str) -> str:
+        return ' '.join(['test', '-e', self.quote(path)])
+
+    def mkdtemp(
+        self,
+        basefile: str | None = None,
+        system: bool = False,
+        mode: int = 0o700,
+        tmpdir: str | None = None,
+    ) -> str:
         if not basefile:
-            basefile = 'ansible-tmp-%s-%s' % (time.time(), random.randint(0, 2**48))
+            basefile = self.__class__._generate_temp_dir_name()
 
         # When system is specified we have to create this in a directory where
-        # other users can read and access the temp directory.  This is because
-        # we use system to create tmp dirs for unprivileged users who are
-        # sudo'ing to a second unprivileged user.  The only dirctories where
-        # that is standard are the tmp dirs, /tmp and /var/tmp.  So we only
-        # allow one of those two locations if system=True.  However, users
-        # might want to have some say over which of /tmp or /var/tmp is used
-        # (because /tmp may be a tmpfs and want to conserve RAM or persist the
-        # tmp files beyond a reboot.  So we check if the user set REMOTE_TMP
-        # to somewhere in or below /var/tmp and if so use /var/tmp.  If
-        # anything else we use /tmp (because /tmp is specified by POSIX nad
-        # /var/tmp is not).
+        # other users can read and access the tmp directory.
+        # This is because we use system to create tmp dirs for unprivileged users who are
+        # sudo'ing to a second unprivileged user.
+        # The 'system_tmpdirs' setting defines directories we can use for this purpose
+        # the default are, /tmp and /var/tmp.
+        # So we only allow one of those locations if system=True, using the
+        # passed in tmpdir if it is valid or the first one from the setting if not.
+
         if system:
-            if C.DEFAULT_REMOTE_TMP.startswith('/var/tmp'):
-                basetmpdir = '/var/tmp'
+            if tmpdir:
+                tmpdir = tmpdir.rstrip('/')
+
+            if tmpdir in self.get_option('system_tmpdirs'):
+                basetmpdir = tmpdir
             else:
-                basetmpdir = '/tmp'
+                basetmpdir = self.get_option('system_tmpdirs')[0]
         else:
-            basetmpdir = C.DEFAULT_REMOTE_TMP
+            if tmpdir is None:
+                basetmpdir = self.get_option('remote_tmp')
+            else:
+                basetmpdir = tmpdir
+
         basetmp = self.join_path(basetmpdir, basefile)
 
-        cmd = 'mkdir -p %s echo %s %s' % (self._SHELL_SUB_LEFT, basetmp, self._SHELL_SUB_RIGHT)
-        cmd += ' %s echo %s=%s echo %s %s' % (self._SHELL_AND, basefile, self._SHELL_SUB_LEFT, basetmp, self._SHELL_SUB_RIGHT)
+        # use mkdir -p to ensure parents exist, but mkdir fullpath to ensure last one is created by us
+        cmd = [
+            'mkdir', '-p', self._SHELL_SUB_LEFT, 'echo', basetmpdir, self._SHELL_SUB_RIGHT, self._SHELL_AND,
+            'mkdir', self._SHELL_SUB_LEFT, 'echo', basetmp, self._SHELL_SUB_RIGHT, self._SHELL_AND,
+            f'echo {basefile}={self._SHELL_SUB_LEFT} echo {basetmp} {self._SHELL_SUB_RIGHT}'
+        ]
 
         # change the umask in a subshell to achieve the desired mode
         # also for directories created with `mkdir -p`
         if mode:
-            tmp_umask = 0o777 & ~mode
-            cmd = '%s umask %o %s %s %s' % (self._SHELL_GROUP_LEFT, tmp_umask, self._SHELL_AND, cmd, self._SHELL_GROUP_RIGHT)
+            cmd = [self._SHELL_GROUP_LEFT, 'umask', f'{0o777 & ~mode:o}', self._SHELL_AND] + cmd + [self._SHELL_GROUP_RIGHT]
 
-        return cmd
+        return ' '.join(cmd)
 
-    def expand_user(self, user_home_path):
-        ''' Return a command to expand tildes in a path
+    def _mkdtemp2(
+        self,
+        basefile: str | None = None,
+        system: bool = False,
+        mode: int = 0o700,
+        tmpdir: str | None = None,
+    ) -> _ShellCommand:
+        """Gets command info to create a temporary directory.
 
-        It can be either "~" or "~username".  We use the POSIX definition of
-        a username:
+        This is an internal API that should not be used publicly.
+
+        :args basefile: The base name of the temporary directory.
+        :args system: If True, create the directory in a system-wide location.
+        :args mode: The permissions mode for the directory.
+        :args tmpdir: The directory in which to create the temporary directory.
+        :returns: The shell command to run to create the temp directory.
+        """
+        return _ShellCommand(command=self.mkdtemp(basefile=basefile, system=system, mode=mode, tmpdir=tmpdir), input_data=None)
+
+    def expand_user(
+        self,
+        user_home_path: str,
+        username: str = '',
+    ) -> str:
+        """ Return a command to expand tildes in a path
+
+        It can be either "~" or "~username". We just ignore $HOME
+        We use the POSIX definition of a username:
             http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap03.html#tag_03_426
             http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap03.html#tag_03_276
-        '''
+
+            Falls back to 'current working directory' as we assume 'home is where the remote user ends up'
+        """
 
         # Check that the user_path to expand is safe
         if user_home_path != '~':
             if not _USER_HOME_PATH_RE.match(user_home_path):
-                # pipes.quote will make the shell return the string verbatim
-                user_home_path = pipes.quote(user_home_path)
-        return 'echo %s' % user_home_path
+                user_home_path = self.quote(user_home_path)
+        elif username:
+            # if present the user name is appended to resolve "that user's home"
+            user_home_path += username
 
-    def build_module_command(self, env_string, shebang, cmd, arg_path=None, rm_tmp=None):
-        # don't quote the cmd if it's an empty string, because this will break pipelining mode
-        if cmd.strip() != '':
-            cmd = pipes.quote(cmd)
+        return f'echo {user_home_path}'
 
-        cmd_parts = []
-        if shebang:
-            shebang = shebang.replace("#!", "").strip()
-        else:
-            shebang = ""
-        cmd_parts.extend([env_string.strip(), shebang, cmd])
-        if arg_path is not None:
-            cmd_parts.append(arg_path)
-        new_cmd = " ".join(cmd_parts)
-        if rm_tmp:
-            new_cmd = '%s; rm -rf "%s" %s' % (new_cmd, rm_tmp, self._SHELL_REDIRECT_ALLNULL)
-        return new_cmd
+    def _expand_user2(
+        self,
+        user_home_path: str,
+        username: str = '',
+    ) -> _ShellCommand:
+        """Gets command to expand user path.
 
-    def append_command(self, cmd, cmd_to_append):
+        This is an internal API that should not be used publicly.
+
+        :args user_home_path: The path to expand.
+        :args username: The username to use for expansion.
+        :returns: The shell command to run to get the expanded user path.
+        """
+        return _ShellCommand(command=self.expand_user(user_home_path, username=username), input_data=None)
+
+    def pwd(self) -> str:
+        """Return the working directory after connecting"""
+        return 'pwd'
+
+    def build_module_command(self, env_string, shebang, cmd, arg_path=None):
+        if shebang is None:
+            shebang = ''
+        cmd_parts = [shebang.removeprefix('#!'), cmd, arg_path]
+        return ' '.join([env_string, self.join([raw_cmd_part.strip() for raw_cmd_part in cmd_parts if raw_cmd_part])])
+
+    def append_command(self, cmd: str, cmd_to_append: str) -> str:
         """Append an additional command if supported by the shell"""
-
         if self._SHELL_AND:
-            cmd += ' %s %s' % (self._SHELL_AND, cmd_to_append)
-
+            cmd = ' '.join([cmd, self._SHELL_AND, cmd_to_append])
         return cmd
+
+    def wrap_for_exec(self, cmd):
+        """wrap script execution with any necessary decoration (eg '&' for quoted powershell script paths)"""
+        display.deprecated(
+            msg='The Shell.wrap_for_exec method is deprecated.',
+            help_text="Contact plugin author to update their plugin to not use this method.",
+            version='2.24',
+        )
+        return cmd
+
+    def quote(self, cmd: str) -> str:
+        """Returns a shell-escaped string that can be safely used as one token in a shell command line"""
+        return shlex.quote(cmd)
+
+    def join(self, cmd_parts: list[str]) -> str:
+        """Returns a shell-escaped string from a list that can be safely used in a shell command line"""
+        return shlex.join(cmd_parts)

@@ -14,8 +14,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
 from ansible.plugins.action import ActionBase
 
@@ -27,17 +26,26 @@ class ActionModule(ActionBase):
         if task_vars is None:
             task_vars = dict()
 
-        if self._task.environment:
+        if self._task.environment and any(self._task.environment):
             self._display.warning('raw module does not support the environment keyword')
 
         result = super(ActionModule, self).run(tmp, task_vars)
+        del tmp  # tmp no longer has any effect
 
-        if self._play_context.check_mode:
-            # in --check mode, always skip this module execution
-            result['skipped'] = True
+        if self._task.check_mode:
+            # in --check mode, always indicate raw didn't run
+            result['skipped'] = True  # deprecated: description='returning skipped from actions/modules' core_version='2.25'
+            result['changed'] = False
+            result['msg'] = "Task `raw` did not execute due to check_mode"
             return result
 
         executable = self._task.args.get('executable', False)
         result.update(self._low_level_execute_command(self._task.args.get('_raw_params'), executable=executable))
+
+        result['changed'] = True
+
+        if 'rc' in result and result['rc'] != 0:
+            result['failed'] = True
+            result['msg'] = 'non-zero return code'
 
         return result

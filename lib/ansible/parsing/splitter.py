@@ -15,26 +15,29 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-import re
 import codecs
+import re
 
 from ansible.errors import AnsibleParserError
+from ansible.module_utils.common.text.converters import to_text
+from ansible.module_utils._internal._datatag import AnsibleTagHelper
+from ansible._internal._datatag._tags import Origin, TrustedAsTemplate
 from ansible.parsing.quoting import unquote
+
 
 # Decode escapes adapted from rspeer's answer here:
 # http://stackoverflow.com/questions/4020539/process-escape-sequences-in-a-string-in-python
 _HEXCHAR = '[a-fA-F0-9]'
-_ESCAPE_SEQUENCE_RE = re.compile(r'''
+_ESCAPE_SEQUENCE_RE = re.compile(r"""
     ( \\U{0}           # 8-digit hex escapes
     | \\u{1}           # 4-digit hex escapes
     | \\x{2}           # 2-digit hex escapes
     | \\N\{{[^}}]+\}}  # Unicode characters by name
     | \\[\\'"abfnrtv]  # Single-character escapes
-    )'''.format(_HEXCHAR*8, _HEXCHAR*4, _HEXCHAR*2), re.UNICODE | re.VERBOSE)
+    )""".format(_HEXCHAR * 8, _HEXCHAR * 4, _HEXCHAR * 2), re.UNICODE | re.VERBOSE)
+
 
 def _decode_escapes(s):
     def decode_match(match):
@@ -42,27 +45,27 @@ def _decode_escapes(s):
 
     return _ESCAPE_SEQUENCE_RE.sub(decode_match, s)
 
+
 def parse_kv(args, check_raw=False):
-    '''
+    """
     Convert a string of key/value items to a dict. If any free-form params
     are found and the check_raw option is set to True, they will be added
     to a new parameter called '_raw_params'. If check_raw is not enabled,
     they will simply be ignored.
-    '''
+    """
 
-    ### FIXME: args should already be a unicode string
-    from ansible.utils.unicode import to_unicode
-    args = to_unicode(args, nonstring='passthru')
+    tags = []
+    if origin_tag := Origin.get_tag(args):
+        # NB: adjusting the column number is left as an exercise for the reader
+        tags.append(origin_tag)
+    if trusted_tag := TrustedAsTemplate.get_tag(args):
+        tags.append(trusted_tag)
+
+    args = to_text(args, nonstring='passthru')
 
     options = {}
     if args is not None:
-        try:
-            vargs = split_args(args)
-        except ValueError as ve:
-            if 'no closing quotation' in str(ve).lower():
-                raise AnsibleParsingError("error parsing argument string, try quoting the entire line.")
-            else:
-                raise
+        vargs = split_args(args)
 
         raw_params = []
         for orig_x in vargs:
@@ -83,9 +86,8 @@ def parse_kv(args, check_raw=False):
                 k = x[:pos]
                 v = x[pos + 1:]
 
-                # FIXME: make the retrieval of this list of shell/command
-                #        options a function, so the list is centralized
-                if check_raw and k not in ('creates', 'removes', 'chdir', 'executable', 'warn'):
+                # FIXME: make the retrieval of this list of shell/command options a function, so the list is centralized
+                if check_raw and k not in ('creates', 'removes', 'chdir', 'executable', 'warn', 'stdin', 'stdin_add_newline', 'strip_empty_ends'):
                     raw_params.append(orig_x)
                 else:
                     options[k.strip()] = unquote(v.strip())
@@ -95,21 +97,28 @@ def parse_kv(args, check_raw=False):
         # recombine the free-form params, if any were found, and assign
         # them to a special option for use later by the shell/command module
         if len(raw_params) > 0:
-            options[u'_raw_params'] = ' '.join(raw_params)
+            options[u'_raw_params'] = join_args(raw_params)
+
+    if tags:
+        options = {AnsibleTagHelper.tag(k, tags): AnsibleTagHelper.tag(v, tags) for k, v in options.items()}
+
+    if origin_tag:
+        options = origin_tag.tag(options)
 
     return options
 
+
 def _get_quote_state(token, quote_char):
-    '''
+    """
     the goal of this block is to determine if the quoted string
     is unterminated in which case it needs to be put back together
-    '''
+    """
     # the char before the current one, used to see if
     # the current character is escaped
     prev_char = None
     for idx, cur_char in enumerate(token):
         if idx > 0:
-            prev_char = token[idx-1]
+            prev_char = token[idx - 1]
         if cur_char in '"\'' and prev_char != '\\':
             if quote_char:
                 if cur_char == quote_char:
@@ -118,13 +127,14 @@ def _get_quote_state(token, quote_char):
                 quote_char = cur_char
     return quote_char
 
+
 def _count_jinja2_blocks(token, cur_depth, open_token, close_token):
-    '''
+    """
     this function counts the number of opening/closing blocks for a
     given opening/closing type and adjusts the current depth for that
     block based on the difference
-    '''
-    num_open  = token.count(open_token)
+    """
+    num_open = token.count(open_token)
     num_close = token.count(close_token)
     if num_open != num_close:
         cur_depth += (num_open - num_close)
@@ -132,8 +142,23 @@ def _count_jinja2_blocks(token, cur_depth, open_token, close_token):
             cur_depth = 0
     return cur_depth
 
+
+def join_args(s):
+    """
+    Join the original cmd based on manipulations by split_args().
+    This retains the original newlines and whitespaces.
+    """
+    result = ''
+    for p in s:
+        if len(result) == 0 or result.endswith('\n'):
+            result += p
+        else:
+            result += ' ' + p
+    return result
+
+
 def split_args(args):
-    '''
+    """
     Splits args on whitespace, but intelligently reassembles
     those that may have been split over a jinja2 block or quotes.
 
@@ -146,15 +171,17 @@ def split_args(args):
 
     Basically this is a variation shlex that has some more intelligence for
     how Ansible needs to use it.
-    '''
+    """
+
+    if not args:
+        return []
 
     # the list of params parsed out of the arg string
     # this is going to be the result value when we are done
     params = []
 
-    # Initial split on white space
-    args = args.strip()
-    items = args.strip().split('\n')
+    # Initial split on newlines
+    items = args.split('\n')
 
     # iterate over the tokens, and reassemble any that may have been
     # split on a space inside a jinja2 block.
@@ -166,21 +193,31 @@ def split_args(args):
 
     quote_char = None
     inside_quotes = False
-    print_depth   = 0 # used to count nested jinja2 {{ }} blocks
-    block_depth   = 0 # used to count nested jinja2 {% %} blocks
-    comment_depth = 0 # used to count nested jinja2 {# #} blocks
+    print_depth = 0  # used to count nested jinja2 {{ }} blocks
+    block_depth = 0  # used to count nested jinja2 {% %} blocks
+    comment_depth = 0  # used to count nested jinja2 {# #} blocks
 
     # now we loop over each split chunk, coalescing tokens if the white space
     # split occurred within quotes or a jinja2 block of some kind
-    for itemidx,item in enumerate(items):
+    for (itemidx, item) in enumerate(items):
 
         # we split on spaces and newlines separately, so that we
         # can tell which character we split on for reassembly
         # inside quotation characters
-        tokens = item.strip().split(' ')
+        tokens = item.split(' ')
 
         line_continuation = False
-        for idx,token in enumerate(tokens):
+        for (idx, token) in enumerate(tokens):
+
+            # Empty entries means we have subsequent spaces
+            # We want to hold onto them so we can reconstruct them later
+            if len(token) == 0 and idx != 0:
+                # Make sure there is a params item to store result in.
+                if not params:
+                    params.append('')
+
+                params[-1] += ' '
+                continue
 
             # if we hit a line continuation character, but
             # we're not inside quotes, ignore it and continue
@@ -204,19 +241,17 @@ def split_args(args):
             # to the end of the list, since we'll tack on more to it later
             # otherwise, if we're inside any jinja2 block, inside quotes, or we were
             # inside quotes (but aren't now) concat this token to the last param
-            if inside_quotes and not was_inside_quotes and not(print_depth or block_depth or comment_depth):
+            if inside_quotes and not was_inside_quotes and not (print_depth or block_depth or comment_depth):
                 params.append(token)
                 appended = True
             elif print_depth or block_depth or comment_depth or inside_quotes or was_inside_quotes:
                 if idx == 0 and was_inside_quotes:
                     params[-1] = "%s%s" % (params[-1], token)
-                elif len(tokens) > 1:
+                else:
                     spacer = ''
                     if idx > 0:
                         spacer = ' '
                     params[-1] = "%s%s%s" % (params[-1], spacer, token)
-                else:
-                    params[-1] = "%s\n%s" % (params[-1], token)
                 appended = True
 
             # if the number of paired block tags is not the same, the depth has changed, so we calculate that here
@@ -248,14 +283,15 @@ def split_args(args):
         # one item (meaning we split on newlines), add a newline back here
         # to preserve the original structure
         if len(items) > 1 and itemidx != len(items) - 1 and not line_continuation:
-            params[-1] += '\n'
+            # Make sure there is a params item to store result in.
+            if not params:
+                params.append('')
 
-        # always clear the line continuation flag
-        line_continuation = False
+            params[-1] += '\n'
 
     # If we're done and things are not at zero depth or we're still inside quotes,
     # raise an error to indicate that the args were unbalanced
     if print_depth or block_depth or comment_depth or inside_quotes:
-        raise AnsibleParserError("failed at splitting arguments, either an unbalanced jinja2 block or quotes: {}".format(args))
+        raise AnsibleParserError(u"failed at splitting arguments, either an unbalanced jinja2 block or quotes: {0}".format(args))
 
     return params

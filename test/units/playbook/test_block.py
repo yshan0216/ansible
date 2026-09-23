@@ -15,21 +15,17 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
+
+import pytest
+import unittest
 
 from ansible.playbook.block import Block
 from ansible.playbook.task import Task
-from ansible.compat.tests import unittest
 
+
+@pytest.mark.usefixtures('collection_loader')
 class TestBlock(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
-    def tearDown(self):
-        pass
 
     def test_construct_empty_block(self):
         b = Block()
@@ -39,24 +35,24 @@ class TestBlock(unittest.TestCase):
 
     def test_load_block_simple(self):
         ds = dict(
-           block = [],
-           rescue = [],
-           always = [],
-           #otherwise = [],
+            block=[],
+            rescue=[],
+            always=[],
+            # otherwise=[],
         )
         b = Block.load(ds)
         self.assertEqual(b.block, [])
         self.assertEqual(b.rescue, [])
         self.assertEqual(b.always, [])
         # not currently used
-        #self.assertEqual(b.otherwise, [])
+        # self.assertEqual(b.otherwise, [])
 
     def test_load_block_with_tasks(self):
         ds = dict(
-           block = [dict(action='block')],
-           rescue = [dict(action='rescue')],
-           always = [dict(action='always')],
-           #otherwise = [dict(action='otherwise')],
+            block=[dict(action='block')],
+            rescue=[dict(action='rescue')],
+            always=[dict(action='always')],
+            # otherwise=[dict(action='otherwise')],
         )
         b = Block.load(ds)
         self.assertEqual(len(b.block), 1)
@@ -66,12 +62,11 @@ class TestBlock(unittest.TestCase):
         self.assertEqual(len(b.always), 1)
         self.assertIsInstance(b.always[0], Task)
         # not currently used
-        #self.assertEqual(len(b.otherwise), 1)
-        #self.assertIsInstance(b.otherwise[0], Task)
+        # self.assertEqual(len(b.otherwise), 1)
+        # self.assertIsInstance(b.otherwise[0], Task)
 
     def test_load_implicit_block(self):
         ds = [dict(action='foo')]
         b = Block.load(ds)
         self.assertEqual(len(b.block), 1)
         self.assertIsInstance(b.block[0], Task)
-

@@ -1,72 +1,131 @@
-# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# Copyright: (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-from ansible.parsing.dataloader import DataLoader
+from __future__ import annotations
 
-class TaskResult:
-    '''
-    This class is responsible for interpretting the resulting data
-    from an executed task, and provides helper methods for determining
-    the result of a given task.
-    '''
+import collections.abc as _c
+import functools
+import typing as t
 
-    def __init__(self, host, task, return_data):
-        self._host = host
-        self._task = task
-        if isinstance(return_data, dict):
-            self._result = return_data.copy()
-        else:
-            self._result = DataLoader().load(return_data)
+from ansible._internal import _collection_proxy
+from ansible.module_utils._internal import _messages
+from ansible.utils.display import Display
 
-    def is_changed(self):
-        return self._check_key('changed')
+if t.TYPE_CHECKING:
+    from ansible._internal import _task
+    from ansible.inventory.host import Host
+    from ansible.playbook.task import Task
 
-    def is_skipped(self):
-        # loop results
-        if 'results' in self._result and self._task.loop:
-            results = self._result['results']
-            # Loop tasks are only considered skipped if all items were skipped.
-            # some squashed results (eg, yum) are not dicts and can't be skipped individually
-            if results and all(isinstance(res, dict) and res.get('skipped', False) for res in results):
-                return True
 
-        # regular tasks and squashed non-dict results
-        return self._result.get('skipped', False)
+class CallbackTaskResult:
+    def __init__(
+        self,
+        host: Host,
+        task: Task,
+        utr: _task.UnifiedTaskResult,
+        mask_result: bool = False,
+    ) -> None:
+        self.__host = host
+        self.__task = task
+        self.__utr = utr
+        self.__mask_result = mask_result
 
-    def is_failed(self):
-        if 'failed_when_result' in self._result or \
-           'results' in self._result and True in [True for x in self._result['results'] if 'failed_when_result' in x]:
-            return self._check_key('failed_when_result')
-        else:
-            return self._check_key('failed') or self._result.get('rc', 0) != 0
+    @property
+    def host(self) -> Host:
+        """The host associated with this result."""
+        return self.__host
 
-    def is_unreachable(self):
-        return self._check_key('unreachable')
+    @property
+    def _host(self) -> Host:
+        """Use the `host` property when supporting only ansible-core 2.19 or later."""
+        # deprecated: description='Deprecate `_host` in favor of `host`' core_version='2.23'
+        return self.__host
 
-    def _check_key(self, key):
-        if 'results' in self._result and self._task.loop:
-            flag = False
-            for res in self._result.get('results', []):
-                if isinstance(res, dict):
-                    flag |= res.get(key, False)
-            return flag
-        else:
-            return self._result.get(key, False)
+    @property
+    def task(self) -> Task:
+        """The task associated with this result."""
+        return self.__task
+
+    @property
+    def _task(self) -> Task:
+        """Use the `task` property when supporting only ansible-core 2.19 or later."""
+        # deprecated: description='Deprecate `_task` in favor of `task`' core_version='2.23'
+        return self.__task
+
+    @property
+    def task_fields(self) -> _c.Mapping[str, t.Any]:
+        """The task fields associated with this result."""
+        Display().deprecated(
+            msg="The `CallbackTaskResult.task_fields` mapping is deprecated.",
+            help_text="Use `CallbackTaskResult.task` instead.",
+            version="2.24",
+        )
+
+        return self.__task.dump_attrs()
+
+    @property
+    def _task_fields(self) -> _c.Mapping[str, t.Any]:
+        """Use the `task_fields` property when supporting only ansible-core 2.19 or later."""
+        # deprecated: description='Deprecate `_task_fields` in favor of `task`' core_version='2.23'
+        # Display().deprecated(
+        #     msg="The `CallbackTaskResult._task_fields` mapping is deprecated.",
+        #     help_text="Use `CallbackTaskResult.task` instead.",
+        #     version="2.26",
+        # )
+
+        return self.__task.dump_attrs()
+
+    @property
+    def exception(self) -> _messages.ErrorSummary | None:
+        """The error from this task result, if any."""
+        return self.__utr.exception
+
+    @property
+    def warnings(self) -> _c.Sequence[_messages.WarningSummary]:
+        """The warnings for this task, if any."""
+        return _collection_proxy.SequenceProxy(self.__utr.warnings or [])
+
+    @property
+    def deprecations(self) -> _c.Sequence[_messages.DeprecationSummary]:
+        """The deprecation warnings for this task, if any."""
+        return _collection_proxy.SequenceProxy(self.__utr.deprecations or [])
+
+    @property
+    def task_name(self) -> str:
+        return self.task.get_name()
+
+    def is_changed(self) -> bool:
+        return self.__utr.changed
+
+    def is_skipped(self) -> bool:
+        return bool(self.__utr.skipped)
+
+    def is_failed(self) -> bool:
+        return self.__utr.failed
+
+    def is_unreachable(self) -> bool:
+        return bool(self.__utr.unreachable)
+
+    @property
+    def _result(self) -> _c.MutableMapping[str, t.Any]:
+        """Use the `result` property when supporting only ansible-core 2.19 or later."""
+        # deprecated: description='Deprecate `_result` in favor of `result`' core_version='2.23'
+        return self.result
+
+    @functools.cached_property
+    def result(self) -> _c.MutableMapping[str, t.Any]:
+        """
+        Returns a cached copy of the task result dictionary for consumption by callbacks.
+        Internal custom types are transformed to native Python types to facilitate access and serialization.
+        """
+        # RPFIX-9: FUTURE: consolidate the no_log logic earlier so we don't have to check both the task and UTR here
+        return self.__utr.as_result_dict(
+            for_callback=True,
+            censor_callback_result=self.task.no_log or self.__utr.no_log,
+            mask_callback_result=self.__mask_result,
+        )
+
+
+TaskResult = CallbackTaskResult
+"""Compatibility name for the pre-2.19 callback-shaped TaskResult passed to callbacks."""

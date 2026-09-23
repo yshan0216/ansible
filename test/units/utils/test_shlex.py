@@ -15,6 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import annotations
+
 import unittest
 
 from ansible.utils.shlex import shlex_split
@@ -36,4 +38,3 @@ class TestSplit(unittest.TestCase):
 
     def test_error(self):
         self.assertRaises(ValueError, shlex_split, 'a "b')
-

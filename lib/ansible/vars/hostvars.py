@@ -15,97 +15,103 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
 
-import collections
-import sys
+import collections.abc as c
+import typing as t
 
-from jinja2 import Undefined as j2undefined
+from ansible.module_utils._internal import _datatag
 
-from ansible import constants as C
-from ansible.inventory.host import Host
-from ansible.template import Templar
+if t.TYPE_CHECKING:
+    from ansible.inventory.manager import InventoryManager
+    from ansible.parsing.dataloader import DataLoader
+    from ansible._internal._templating._jinja_common import Marker
+    from ansible.vars.manager import VariableManager
 
-STATIC_VARS = [
-  'inventory_hostname', 'inventory_hostname_short',
-  'inventory_file', 'inventory_dir', 'playbook_dir',
-  'ansible_play_hosts', 'play_hosts', 'groups', 'ungrouped', 'group_names',
-  'ansible_version', 'omit', 'role_names'
-]
 
-try:
-    from hashlib import sha1
-except ImportError:
-    from sha import sha as sha1
+__all__ = ['HostVars', 'HostVarsVars']
 
-__all__ = ['HostVars']
 
-# Note -- this is a Mapping, not a MutableMapping
-class HostVars(collections.Mapping):
-    ''' A special view of vars_cache that adds values from the inventory when needed. '''
-
-    def __init__(self, inventory, variable_manager, loader):
-        self._lookup = dict()
+class HostVars(c.Mapping):
+    """A read-only wrapper to enable on-demand templating of a specific host's variables under that host's variable context."""
+    def __init__(self, inventory: InventoryManager, variable_manager: VariableManager, loader: DataLoader) -> None:
         self._inventory = inventory
         self._loader = loader
         self._variable_manager = variable_manager
-        variable_manager._hostvars = self
-        self._cached_result = dict()
 
-    def set_variable_manager(self, variable_manager):
-        self._variable_manager = variable_manager
         variable_manager._hostvars = self
 
-    def set_inventory(self, inventory):
-        self._inventory = inventory
+    def raw_get(self, host_name: str) -> dict[str, t.Any] | Marker:
+        """
+        Similar to __getitem__, however the returned data is not run through
+        the templating engine to expand variables in the hostvars.
+        """
+        # does not use inventory.hosts, so it can create localhost on demand
+        host = self._inventory.get_host(host_name)
 
-    def _find_host(self, host_name):
-        if host_name in C.LOCALHOST:
-            host = self._inventory.localhost
-        else:
-            host = self._inventory.get_host(host_name)
-        return host
-
-    def __getitem__(self, host_name):
-        host = self._find_host(host_name)
         if host is None:
-            raise j2undefined
+            from ansible._internal._templating import _jinja_bits
 
-        data = self._variable_manager.get_vars(loader=self._loader, host=host, include_hostvars=False)
+            return _jinja_bits._undef(f"hostvars[{host_name!r}]")
 
-        sha1_hash = sha1(str(data).encode('utf-8')).hexdigest()
-        if sha1_hash in self._cached_result:
-            result = self._cached_result[sha1_hash]
-        else:
-            templar = Templar(variables=data, loader=self._loader)
-            result = templar.template(data, fail_on_undefined=False, static_vars=STATIC_VARS)
-            self._cached_result[sha1_hash] = result
-        return result
+        return self._variable_manager.get_vars(host=host, include_hostvars=False)
 
-    def set_host_variable(self, host, varname, value):
-        self._variable_manager.set_host_variable(host, varname, value)
+    def __getitem__(self, key: str) -> HostVarsVars | Marker:
+        data = self.raw_get(key)
 
-    def set_nonpersistent_facts(self, host, facts):
-        self._variable_manager.set_nonpersistent_facts(host, facts)
+        from ansible._internal._templating import _jinja_bits
 
-    def set_host_facts(self, host, facts):
-        self._variable_manager.set_host_facts(host, facts)
+        if isinstance(data, _jinja_bits.Marker):
+            return data
 
-    def __contains__(self, host_name):
-        return self._find_host(host_name) is not None
+        return HostVarsVars(data, loader=self._loader, host=key)
 
-    def __iter__(self):
-        for host in self._inventory.get_hosts(ignore_limits_and_restrictions=True):
-            yield host
+    def __contains__(self, item: object) -> bool:
+        # does not use inventory.hosts, so it can create localhost on demand
+        return self._inventory.get_host(item) is not None
 
-    def __len__(self):
-        return len(self._inventory.get_hosts(ignore_limits_and_restrictions=True))
+    def __iter__(self) -> t.Iterator[str]:
+        yield from self._inventory.hosts
 
-    def __repr__(self):
-        out = {}
-        for host in self._inventory.get_hosts(ignore_limits_and_restrictions=True):
-            name = host.name
-            out[name] = self.get(name)
-        return repr(out)
+    def __len__(self) -> int:
+        return len(self._inventory.hosts)
+
+    def __deepcopy__(self, memo: t.Any) -> HostVars:
+        # this object may be stored in a var dict that is itself deep copied, but since the underlying data
+        # is supposed to be immutable, we don't need to actually copy the data
+        return self
+
+
+class HostVarsVars(c.Mapping):
+    """A read-only view of a specific host's vars that will template on access under that host's variable context."""
+
+    def __init__(self, variables: dict[str, t.Any], loader: DataLoader | None, host: str) -> None:
+        from ansible._internal._templating import _engine
+
+        self._vars = variables
+        self._templar = _engine.TemplateEngine(variables=variables, loader=loader)
+        self._host = host
+
+    def __getitem__(self, key: str) -> t.Any:
+        return self._templar.template(self._vars[key])
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._vars
+
+    def __iter__(self) -> t.Iterator[str]:
+        yield from self._vars
+
+    def __len__(self) -> int:
+        return len(self._vars)
+
+    def __repr__(self) -> str:
+        return f'HostVarsVars({self._host=!r}, ...)'
+
+    def __deepcopy__(self, memo: t.Any) -> HostVarsVars:
+        # this may be stored in a var dict that is itself deep copied, but since the underlying data
+        # is supposed to be immutable, we don't need to actually copy the data
+        return self
+
+
+# DTFIX-FUTURE: is there a better way to add this to the ignorable types in the module_utils code
+_datatag._untaggable_types.update({HostVars, HostVarsVars})

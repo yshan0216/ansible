@@ -15,21 +15,47 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
+from __future__ import annotations
+
+import math
+
 
 def issubset(a, b):
     return set(a) <= set(b)
 
+
 def issuperset(a, b):
     return set(a) >= set(b)
 
+
+def isnotanumber(x):
+    try:
+        return math.isnan(x)
+    except TypeError:
+        return False
+
+
+def contains(seq, value):
+    """Opposite of the ``in`` test, allowing use as a test in filters like ``selectattr``
+
+    .. versionadded:: 2.8
+    """
+    return value in seq
+
+
 class TestModule:
-    ''' Ansible math jinja2 tests '''
+    """ Ansible math jinja2 tests """
 
     def tests(self):
         return {
             # set theory
+            'subset': issubset,
             'issubset': issubset,
+            'superset': issuperset,
             'issuperset': issuperset,
+            'contains': contains,
+
+            # numbers
+            'nan': isnotanumber,
+            'isnan': isnotanumber,
         }

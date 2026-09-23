@@ -1,36 +1,17 @@
 # -*- coding: utf-8 -*-
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# Copyright (c) 2017 Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-# Make coding more python3-ish
-from __future__ import (absolute_import, division)
-__metaclass__ = type
+from __future__ import annotations
 
-import errno
-import json
-import sys
-import time
-from io import BytesIO, StringIO
+import selectors
+from itertools import product
+from io import BytesIO
 
-from ansible.compat.tests import unittest
-from ansible.compat.tests.mock import call, MagicMock, Mock, patch, sentinel
+import pytest
 
-from units.mock.procenv import swap_stdin_and_argv
+from ansible.module_utils.common.text.converters import to_native
 
-import ansible.module_utils.basic
 
 class OpenBytesIO(BytesIO):
     """BytesIO with dummy close() method
@@ -42,145 +23,313 @@ class OpenBytesIO(BytesIO):
         pass
 
 
-@unittest.skipIf(sys.version_info[0] >= 3, "Python 3 is not supported on targets (yet)")
-class TestAnsibleModuleRunCommand(unittest.TestCase):
-    def setUp(self):
-        self.cmd_out = {
-            # os.read() is returning 'bytes', not strings
-            sentinel.stdout: BytesIO(),
-            sentinel.stderr: BytesIO(),
+@pytest.fixture
+def mock_os(mocker):
+    def mock_os_abspath(path):
+        if path.startswith('/'):
+            return path
+        else:
+            return os.getcwd.return_value + '/' + path
+
+    os = mocker.patch('ansible.module_utils.basic.os')
+
+    os.path.expandvars.side_effect = lambda x: x
+    os.path.expanduser.side_effect = lambda x: x
+    os.environ = {'PATH': '/bin'}
+    os.getcwd.return_value = '/home/foo'
+    os.path.isdir.return_value = True
+    os.path.abspath.side_effect = mock_os_abspath
+
+    yield os
+
+
+class SpecialBytesIO(BytesIO):
+    def __init__(self, *args, **kwargs):
+        fh = kwargs.pop('fh', None)
+        super(SpecialBytesIO, self).__init__(*args, **kwargs)
+        self.fh = fh
+
+    def fileno(self):
+        return self.fh
+
+    # We need to do this because some of our tests create a new value for stdout and stderr
+    # The new value is able to affect the string that is returned by the subprocess stdout and
+    # stderr but by the time the test gets it, it is too late to change the SpecialBytesIO that
+    # subprocess.Popen returns for stdout and stderr.  If we could figure out how to change those as
+    # well, then we wouldn't need this.
+    def __eq__(self, other):
+        if id(self) == id(other) or self.fh == other.fileno():
+            return True
+        return False
+
+
+class DummyKey:
+    def __init__(self, fileobj):
+        self.fileobj = fileobj
+
+
+@pytest.fixture
+def mock_subprocess(mocker):
+
+    class MockSelector(selectors.BaseSelector):
+        def __init__(self):
+            super(MockSelector, self).__init__()
+            self._file_objs = []
+
+        def register(self, fileobj, events, data=None):
+            self._file_objs.append(fileobj)
+
+        def unregister(self, fileobj):
+            self._file_objs.remove(fileobj)
+
+        def select(self, timeout=None):
+            ready = []
+            for file_obj in self._file_objs:
+                ready.append((DummyKey(subprocess._output[file_obj.fileno()]), selectors.EVENT_READ))
+            return ready
+
+        def get_map(self):
+            return self._file_objs
+
+        def close(self):
+            super(MockSelector, self).close()
+            self._file_objs = []
+
+    selectors.PollSelector = MockSelector
+
+    subprocess = mocker.patch('ansible.module_utils.basic.subprocess')
+    subprocess._output = {mocker.sentinel.stdout: SpecialBytesIO(b'', fh=mocker.sentinel.stdout),
+                          mocker.sentinel.stderr: SpecialBytesIO(b'', fh=mocker.sentinel.stderr)}
+
+    cmd = mocker.MagicMock()
+    cmd.returncode = 0
+    cmd.stdin = OpenBytesIO()
+    cmd.stdout = subprocess._output[mocker.sentinel.stdout]
+    cmd.stderr = subprocess._output[mocker.sentinel.stderr]
+    subprocess.Popen.return_value = cmd
+
+    yield subprocess
+
+
+@pytest.fixture()
+def rc_am(mocker, am, mock_os, mock_subprocess):
+    am.fail_json = mocker.MagicMock(side_effect=SystemExit)
+    am._os = mock_os
+    am._subprocess = mock_subprocess
+    yield am
+
+
+class TestRunCommandArgs:
+    # Format is command as passed to run_command, command to Popen as list, command to Popen as string
+    ARGS_DATA = (
+                (['/bin/ls', 'a', 'b', 'c'], [b'/bin/ls', b'a', b'b', b'c'], b'/bin/ls a b c'),
+                ('/bin/ls a " b" "c "', [b'/bin/ls', b'a', b' b', b'c '], b'/bin/ls a " b" "c "'),
+    )
+
+    @pytest.mark.parametrize('cmd, expected, shell, stdin',
+                             [(arg, cmd_str if sh else cmd_lst, sh, {})
+                              for (arg, cmd_lst, cmd_str), sh in product(ARGS_DATA, (True, False))],
+                             indirect=['stdin'])
+    def test_args(self, cmd, expected, shell, rc_am):
+        rc_am.run_command(cmd, use_unsafe_shell=shell)
+        assert rc_am._subprocess.Popen.called
+        args, kwargs = rc_am._subprocess.Popen.call_args
+        assert args == (expected, )
+        assert kwargs['shell'] == shell
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_tuple_as_args(self, rc_am):
+        with pytest.raises(SystemExit):
+            rc_am.run_command(('ls', '/'))
+        assert rc_am.fail_json.called
+
+
+class TestRunCommandCwd:
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_cwd(self, mocker, rc_am):
+        rc_am.run_command('/bin/ls', cwd='/new')
+        assert rc_am._subprocess.Popen.mock_calls[0][2]['cwd'] == b'/new'
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_cwd_relative_path(self, mocker, rc_am):
+        rc_am.run_command('/bin/ls', cwd='sub-dir')
+        assert rc_am._subprocess.Popen.mock_calls[0][2]['cwd'] == b'/home/foo/sub-dir'
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_cwd_not_a_dir(self, mocker, rc_am):
+        rc_am.run_command('/bin/ls', cwd='/not-a-dir')
+        assert rc_am._subprocess.Popen.mock_calls[0][2]['cwd'] == b'/not-a-dir'
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_cwd_not_a_dir_noignore(self, rc_am):
+        rc_am._os.path.isdir.side_effect = lambda d: d != b'/not-a-dir'
+        with pytest.raises(SystemExit):
+            rc_am.run_command('/bin/ls', cwd='/not-a-dir', ignore_invalid_cwd=False)
+        assert rc_am.fail_json.called
+
+
+class TestRunCommandPrompt:
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_prompt_bad_regex(self, rc_am):
+        with pytest.raises(SystemExit):
+            rc_am.run_command('foo', prompt_regex='[pP)assword:')
+        assert rc_am.fail_json.called
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_prompt_no_match(self, mocker, rc_am):
+        rc_am._os._cmd_out[mocker.sentinel.stdout] = BytesIO(b'hello')
+        (rc, stdout, stderr) = rc_am.run_command('foo', prompt_regex='[pP]assword:')
+        assert rc == 0
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_prompt_match_wo_data(self, mocker, rc_am):
+        rc_am._subprocess._output = {mocker.sentinel.stdout:
+                                     SpecialBytesIO(b'Authentication required!\nEnter password: ',
+                                                    fh=mocker.sentinel.stdout),
+                                     mocker.sentinel.stderr:
+                                     SpecialBytesIO(b'', fh=mocker.sentinel.stderr)}
+        (rc, stdout, stderr) = rc_am.run_command('foo', prompt_regex=r'[pP]assword:', data=None)
+        assert rc == 257
+
+
+class TestRunCommandRc:
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_check_rc_false(self, rc_am):
+        rc_am._subprocess.Popen.return_value.returncode = 1
+        (rc, stdout, stderr) = rc_am.run_command('/bin/false', check_rc=False)
+        assert rc == 1
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_check_rc_true(self, rc_am):
+        rc_am._subprocess.Popen.return_value.returncode = 1
+        with pytest.raises(SystemExit):
+            rc_am.run_command('/bin/false', check_rc=True)
+        assert rc_am.fail_json.called
+        args, kwargs = rc_am.fail_json.call_args
+        assert kwargs['rc'] == 1
+
+
+class TestRunCommandOutput:
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_text_stdin(self, rc_am):
+        (rc, stdout, stderr) = rc_am.run_command('/bin/foo', data='hello world')
+        assert rc_am._subprocess.Popen.return_value.stdin.getvalue() == b'hello world\n'
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_ascii_stdout(self, mocker, rc_am):
+        rc_am._subprocess._output = {mocker.sentinel.stdout:
+                                     SpecialBytesIO(b'hello', fh=mocker.sentinel.stdout),
+                                     mocker.sentinel.stderr:
+                                     SpecialBytesIO(b'', fh=mocker.sentinel.stderr)}
+        (rc, stdout, stderr) = rc_am.run_command('/bin/cat hello.txt')
+        assert rc == 0
+        # module_utils function.  On py3 it returns text and py2 it returns
+        # bytes because it's returning native strings
+        assert stdout == 'hello'
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_utf8_output(self, mocker, rc_am):
+        rc_am._subprocess._output = {mocker.sentinel.stdout:
+                                     SpecialBytesIO(u'Žarn§'.encode('utf-8'),
+                                                    fh=mocker.sentinel.stdout),
+                                     mocker.sentinel.stderr:
+                                     SpecialBytesIO(u'لرئيسية'.encode('utf-8'),
+                                                    fh=mocker.sentinel.stderr)}
+        (rc, stdout, stderr) = rc_am.run_command('/bin/something_ugly')
+        assert rc == 0
+        # module_utils function.  On py3 it returns text and py2 it returns
+        # bytes because it's returning native strings
+        assert stdout == to_native(u'Žarn§')
+        assert stderr == to_native(u'لرئيسية')
+
+
+@pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+def test_run_command_fds(mocker, rc_am):
+    subprocess_mock = mocker.patch('ansible.module_utils.basic.subprocess')
+    subprocess_mock.Popen.side_effect = AssertionError
+
+    try:
+        rc_am.run_command('synchronize', pass_fds=(101, 42))
+    except SystemExit:
+        pass
+
+    assert subprocess_mock.Popen.call_args[1]['pass_fds'] == (101, 42)
+    assert subprocess_mock.Popen.call_args[1]['close_fds'] is True
+
+
+class TestRunCommandNoneRead:
+    """
+    Test handling of read() returning None from non-blocking pipes.
+
+    This tests the fix for issue #86920 where read() can return None
+    in certain edge cases with non-blocking I/O, which would cause
+    TypeError when trying to concatenate None to bytes.
+    """
+
+    class NoneReturningBytesIO(SpecialBytesIO):
+        """
+        BytesIO that returns None on first read, then actual data.
+
+        This simulates edge cases where non-blocking read() returns None
+        to indicate "no data available right now" rather than empty bytes.
+        """
+
+        def __init__(self, *args, **kwargs):
+            # Pop 'data' before calling super().__init__() since BytesIO doesn't accept it
+            self.data = kwargs.pop('data', b'test output')
+            self.read_count = 0
+            super(TestRunCommandNoneRead.NoneReturningBytesIO, self).__init__(*args, **kwargs)
+
+        def read(self, size=-1):
+            self.read_count += 1
+            if self.read_count == 1:
+                # First read returns None (no data available)
+                return None
+            elif self.read_count == 2:
+                # Second read returns actual data
+                return self.data
+            else:
+                # Subsequent reads return empty bytes (EOF)
+                return b''
+
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_none_from_stdout_read(self, mocker, rc_am):
+        """Test that None returned from stdout.read() doesn't cause TypeError."""
+        rc_am._subprocess._output = {
+            mocker.sentinel.stdout:
+                self.NoneReturningBytesIO(fh=mocker.sentinel.stdout, data=b'command output'),
+            mocker.sentinel.stderr:
+                SpecialBytesIO(b'', fh=mocker.sentinel.stderr)
         }
+        (rc, stdout, stderr) = rc_am.run_command('/bin/test')
+        assert rc == 0
+        assert stdout == 'command output'
+        assert stderr == ''
 
-        def mock_os_read(fd, nbytes):
-            return self.cmd_out[fd].read(nbytes)
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_none_from_stderr_read(self, mocker, rc_am):
+        """Test that None returned from stderr.read() doesn't cause TypeError."""
+        rc_am._subprocess._output = {
+            mocker.sentinel.stdout:
+                SpecialBytesIO(b'', fh=mocker.sentinel.stdout),
+            mocker.sentinel.stderr:
+                self.NoneReturningBytesIO(fh=mocker.sentinel.stderr, data=b'error output')
+        }
+        (rc, stdout, stderr) = rc_am.run_command('/bin/test')
+        assert rc == 0
+        assert stdout == ''
+        assert stderr == 'error output'
 
-        def mock_select(rlist, wlist, xlist, timeout=1):
-            return (rlist, [], [])
-
-        def mock_os_chdir(path):
-            if path == '/inaccessible':
-                raise OSError(errno.EPERM, "Permission denied: '/inaccessible'")
-
-        args = json.dumps(dict(ANSIBLE_MODULE_ARGS={}))
-        # unittest doesn't have a clean place to use a context manager, so we have to enter/exit manually
-        self.stdin_swap = swap_stdin_and_argv(stdin_data=args)
-        self.stdin_swap.__enter__()
-
-        ansible.module_utils.basic._ANSIBLE_ARGS = None
-        self.module = ansible.module_utils.basic.AnsibleModule(argument_spec=dict())
-        self.module.fail_json = MagicMock(side_effect=SystemExit)
-
-        self.os = patch('ansible.module_utils.basic.os').start()
-        self.os.path.expandvars.side_effect = lambda x: x
-        self.os.path.expanduser.side_effect = lambda x: x
-        self.os.environ = {'PATH': '/bin'}
-        self.os.getcwd.return_value = '/home/foo'
-        self.os.path.isdir.return_value = True
-        self.os.chdir.side_effect = mock_os_chdir
-        self.os.read.side_effect = mock_os_read
-
-        self.subprocess = patch('ansible.module_utils.basic.subprocess').start()
-        self.cmd = Mock()
-        self.cmd.returncode = 0
-        self.cmd.stdin = OpenBytesIO()
-        self.cmd.stdout.fileno.return_value = sentinel.stdout
-        self.cmd.stderr.fileno.return_value = sentinel.stderr
-        self.subprocess.Popen.return_value = self.cmd
-
-        self.select = patch('ansible.module_utils.basic.select').start()
-        self.select.select.side_effect = mock_select
-
-        self.addCleanup(patch.stopall)
-
-
-    def tearDown(self):
-        # unittest doesn't have a clean place to use a context manager, so we have to enter/exit manually
-        self.stdin_swap.__exit__(None, None, None)
-
-    def test_list_as_args(self):
-        self.module.run_command(['/bin/ls', 'a', ' b', 'c '])
-        self.assertTrue(self.subprocess.Popen.called)
-        args, kwargs = self.subprocess.Popen.call_args
-        self.assertEqual(args, (['/bin/ls', 'a', ' b', 'c '], ))
-        self.assertEqual(kwargs['shell'], False)
-
-    def test_str_as_args(self):
-        self.module.run_command('/bin/ls a " b" "c "')
-        self.assertTrue(self.subprocess.Popen.called)
-        args, kwargs = self.subprocess.Popen.call_args
-        self.assertEqual(args, (['/bin/ls', 'a', ' b', 'c '], ))
-        self.assertEqual(kwargs['shell'], False)
-
-    def test_tuple_as_args(self):
-        self.assertRaises(SystemExit, self.module.run_command, ('ls', '/'))
-        self.assertTrue(self.module.fail_json.called)
-
-    def test_unsafe_shell(self):
-        self.module.run_command('ls a " b" "c "', use_unsafe_shell=True)
-        self.assertTrue(self.subprocess.Popen.called)
-        args, kwargs = self.subprocess.Popen.call_args
-        self.assertEqual(args, ('ls a " b" "c "', ))
-        self.assertEqual(kwargs['shell'], True)
-
-    def test_cwd(self):
-        self.os.getcwd.return_value = '/old'
-        self.module.run_command('/bin/ls', cwd='/new')
-        self.assertEqual(self.os.chdir.mock_calls,
-                         [call('/new'), call('/old'), ])
-
-    def test_cwd_not_a_dir(self):
-        self.os.getcwd.return_value = '/old'
-        self.os.path.isdir.side_effect = lambda d: d != '/not-a-dir'
-        self.module.run_command('/bin/ls', cwd='/not-a-dir')
-        self.assertEqual(self.os.chdir.mock_calls, [call('/old'), ])
-
-    def test_cwd_inaccessible(self):
-        self.assertRaises(SystemExit, self.module.run_command, '/bin/ls', cwd='/inaccessible')
-        self.assertTrue(self.module.fail_json.called)
-        args, kwargs = self.module.fail_json.call_args
-        self.assertEqual(kwargs['rc'], errno.EPERM)
-
-    def test_prompt_bad_regex(self):
-        self.assertRaises(SystemExit, self.module.run_command, 'foo', prompt_regex='[pP)assword:')
-        self.assertTrue(self.module.fail_json.called)
-
-    def test_prompt_no_match(self):
-        self.cmd_out[sentinel.stdout] = BytesIO(b'hello')
-        (rc, _, _) = self.module.run_command('foo', prompt_regex='[pP]assword:')
-        self.assertEqual(rc, 0)
-
-    def test_prompt_match_wo_data(self):
-        self.cmd_out[sentinel.stdout] = BytesIO(b'Authentication required!\nEnter password: ')
-        (rc, _, _) = self.module.run_command('foo', prompt_regex=r'[pP]assword:', data=None)
-        self.assertEqual(rc, 257)
-
-    def test_check_rc_false(self):
-        self.cmd.returncode = 1
-        (rc, _, _) = self.module.run_command('/bin/false', check_rc=False)
-        self.assertEqual(rc, 1)
-
-    def test_check_rc_true(self):
-        self.cmd.returncode = 1
-        self.assertRaises(SystemExit, self.module.run_command, '/bin/false', check_rc=True)
-        self.assertTrue(self.module.fail_json.called)
-        args, kwargs = self.module.fail_json.call_args
-        self.assertEqual(kwargs['rc'], 1)
-
-    def test_text_stdin(self):
-        (rc, stdout, stderr) = self.module.run_command('/bin/foo', data='hello world')
-        self.assertEqual(self.cmd.stdin.getvalue(), b'hello world\n')
-
-    def test_ascii_stdout(self):
-        self.cmd_out[sentinel.stdout] = BytesIO(b'hello')
-        (rc, stdout, stderr) = self.module.run_command('/bin/cat hello.txt')
-        self.assertEqual(rc, 0)
-        self.assertEqual(stdout, b'hello')
-
-    def test_utf8_output(self):
-        self.cmd_out[sentinel.stdout] = BytesIO(u'Žarn§'.encode('utf-8'))
-        self.cmd_out[sentinel.stderr] = BytesIO(u'لرئيسية'.encode('utf-8'))
-        (rc, stdout, stderr) = self.module.run_command('/bin/something_ugly')
-        self.assertEqual(rc, 0)
-        self.assertEqual(stdout.decode('utf-8'), u'Žarn§')
-        self.assertEqual(stderr.decode('utf-8'), u'لرئيسية')
-
+    @pytest.mark.parametrize('stdin', [{}], indirect=['stdin'])
+    def test_none_from_both_pipes(self, mocker, rc_am):
+        """Test that None returned from both pipes doesn't cause TypeError."""
+        rc_am._subprocess._output = {
+            mocker.sentinel.stdout:
+                self.NoneReturningBytesIO(fh=mocker.sentinel.stdout, data=b'stdout data'),
+            mocker.sentinel.stderr:
+                self.NoneReturningBytesIO(fh=mocker.sentinel.stderr, data=b'stderr data')
+        }
+        (rc, stdout, stderr) = rc_am.run_command('/bin/test')
+        assert rc == 0
+        assert stdout == 'stdout data'
+        assert stderr == 'stderr data'
